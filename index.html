@@ -26,7 +26,7 @@
   }
   #fps { font-size:12px; color:#9ad; opacity:.85; margin-left:4px }
 
-  /* Bottom toggle to show/hide the panel */
+  /* Bottom checkbox to show/hide the panel */
   #uiToggleWrap {
     position:fixed; left:50%; bottom:10px; transform:translateX(-50%);
     background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.2);
@@ -64,13 +64,13 @@
 (() => {
   const $ = s => document.querySelector(s);
 
-  // Canvas + offscreen feedback layer
+  // Canvas + feedback buffer
   const cv = $('#c');
-  const ctx = cv.getContext('2d', { alpha:false, desynchronized:true });
+  const ctx = cv.getContext('2d'); // keep options default for max compatibility
   const fb = document.createElement('canvas');
-  const fbc = fb.getContext('2d', { alpha:false });
+  const fbc = fb.getContext('2d');
 
-  let DPR = Math.max(1, Math.min(devicePixelRatio || 1, 2));
+  let DPR = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
   let W=0, H=0;
   function resize(){
     W = cv.width = Math.floor(innerWidth * DPR);
@@ -79,13 +79,14 @@
   }
   addEventListener('resize', resize, {passive:true}); resize();
 
-  // UI
+  // UI show/hide
   const panel = $('#ui');
   const toggle = $('#uiToggle');
   toggle.addEventListener('change', () => {
     panel.style.display = toggle.checked ? 'flex' : 'none';
   });
 
+  // Sliders
   const UI = {
     nodes: $('#nodes'),
     radius: $('#radius'),
@@ -103,12 +104,16 @@
   let last = performance.now();
   let timeScale = +UI.warp.value;
 
-  // Helpers
-  function rnd(a=1){ return Math.random()*a; }
-  function rndN(n=1){ return (Math.random()*2-1)*n; }
+  // FPS hud (define BEFORE draw uses it)
+  const fpsEl = $('#fps');
+  let fpsAcc=0, fpsFrames=0, fpsT=0;
+
+  // Utilities
+  const rnd  = (a=1)=> Math.random()*a;
+  const rndN = (n=1)=> (Math.random()*2-1)*n;
 
   function makeNodes(N){
-    nodes = new Array(N).fill(0).map(()=>({
+    nodes = Array.from({length:N}, () => ({
       x: rnd(W), y: rnd(H),
       vx: rndN(1.5), vy: rndN(1.5),
       r: 1.5 + Math.random()*3.5,
@@ -119,25 +124,30 @@
 
   // Randomize ALL sliders + palette + velocities
   function randomizeAll(){
-    // Randomize every range input in the panel
-    panel.querySelectorAll('input[type="range"]').forEach(inp => {
-      const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
-      // pick a value that aligns with step
+    // Randomize slider values within their min/max using their step precision
+    for (const inp of panel.querySelectorAll('input[type="range"]')) {
+      const min = parseFloat(inp.min), max = parseFloat(inp.max);
+      const step = parseFloat(inp.step || '1');
       const raw = min + Math.random()*(max-min);
       const decimals = (step.toString().split('.')[1]||'').length;
       inp.value = raw.toFixed(decimals);
-    });
-    // Apply side-effects
-    timeScale = +UI.warp.value;
-    makeNodes(+UI.nodes.value);
-    // New hues + fresh motion
-    nodes.forEach(n => {
+    }
+    // Apply from sliders
+    applyFromSliders();
+    // Refresh hues & velocities for visible change
+    for (const n of nodes){
       n.hue = (Math.random()*360)|0;
       const speed = 1.5 + Math.random()*3.0;
       const ang = Math.random()*Math.PI*2;
       n.vx = Math.cos(ang)*speed;
       n.vy = Math.sin(ang)*speed;
-    });
+    }
+  }
+
+  function applyFromSliders(){
+    const desired = +UI.nodes.value|0;
+    if (desired !== nodes.length) makeNodes(desired);
+    timeScale = +UI.warp.value;
   }
 
   // Bind UI
@@ -145,25 +155,29 @@
   $('#pause').addEventListener('click', () => {
     playing=!playing; $('#pause').textContent = playing ? '⏸ Pause' : '▶️ Play';
   });
-  UI.nodes.addEventListener('input', () => makeNodes(+UI.nodes.value));
-  UI.warp.addEventListener('input', () => (timeScale = +UI.warp.value));
+  UI.nodes.addEventListener('input', applyFromSliders);
+  UI.warp.addEventListener('input', applyFromSliders);
 
   // Draw loop
-  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
-  function draw(t){
-    const now = t, dtRaw = Math.max(0, (now - last) / 1000); last = now;
+  function draw(now){
+    const dtRaw = Math.max(0, (now - last) / 1000); last = now;
     const dt = dtRaw * timeScale;
 
     if (playing){
-      // 1) Feedback echo (previous frame) — subtle scale/rotate + additive blend
+      // Trails first (so feedback & new strokes sit on top)
+      const trail = +UI.trail.value;
+      if (trail <= 0) ctx.clearRect(0,0,W,H);
+      else { ctx.fillStyle = `rgba(0,0,0,${trail})`; ctx.fillRect(0,0,W,H); }
+
+      // Visual feedback echo (previous frame), VERY subtle
       const fbAmt = +UI.feedback.value; // 0..1
-      if (fbAmt > 0) {
+      if (fbAmt > 0){
         ctx.save();
         ctx.globalAlpha = Math.min(0.9, fbAmt * 0.6);
         ctx.globalCompositeOperation = 'lighter';
         ctx.translate(W/2, H/2);
-        const s = 1 + fbAmt * 0.004;     // very slight scale
-        const r = fbAmt * 0.0015;        // very slight rotation
+        const s = 1 + fbAmt * 0.004;
+        const r = fbAmt * 0.0015;
         ctx.scale(s, s);
         ctx.rotate(r);
         ctx.translate(-W/2, -H/2);
@@ -172,44 +186,35 @@
         ctx.globalCompositeOperation = 'source-over';
       }
 
-      // 2) Trails (motion persistence)
-      const trail = +UI.trail.value;
-      if (trail <= 0) { ctx.clearRect(0,0,W,H); }
-      else { ctx.fillStyle = `rgba(0,0,0,${trail})`; ctx.fillRect(0,0,W,H); }
-
-      // 3) Physics + draw nodes
+      // Params
       const jitter = +UI.glitch.value;
       const teleP  = +UI.tele.value;
       const linkR  = +UI.radius.value;
       const thick  = +UI.thick.value;
 
+      // Update & draw nodes
       for (const n of nodes){
-        // random kicks
         if (Math.random() < (0.8*jitter) * dt) {
           n.vx += rndN(80*jitter) * dt;
           n.vy += rndN(80*jitter) * dt;
         }
-        // rare teleport
         if (Math.random() < teleP * dt) { n.x = rnd(W); n.y = rnd(H); }
 
-        // integrate
         n.x += n.vx * dt * 60;
         n.y += n.vy * dt * 60;
 
-        // boundary bounce
         if (n.x < 0) { n.x = 0; n.vx = Math.abs(n.vx); }
         if (n.x > W) { n.x = W; n.vx = -Math.abs(n.vx); }
         if (n.y < 0) { n.y = 0; n.vy = Math.abs(n.vy); }
         if (n.y > H) { n.y = H; n.vy = -Math.abs(n.vy); }
 
-        // node dot
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
         ctx.fillStyle = `hsl(${n.hue},85%,${45 + Math.min(40, Math.hypot(n.vx,n.vy))}%)`;
         ctx.fill();
       }
 
-      // 4) Edges / scaffolding (two-pass for depth)
+      // Edges / scaffolding (two-pass for depth)
       const N = nodes.length;
       ctx.lineCap = 'round';
       for (let pass=0; pass<2; pass++){
@@ -224,7 +229,6 @@
             if (d < reach){
               const fade = 1 - d / reach;
               ctx.strokeStyle = `rgba(${180+pass*40},${210-pass*20},255,${0.06 + fade*0.5})`;
-              // mid-segment warp for glitch vibe
               const mx = (a.x+b.x)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
               const my = (a.y+b.y)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
               ctx.beginPath();
@@ -237,21 +241,25 @@
         }
       }
 
-      // 5) Update feedback buffer for next frame
+      // Update feedback buffer (snapshot current frame)
       fbc.clearRect(0,0,W,H);
       fbc.drawImage(cv, 0, 0, W, H);
     }
 
-    // FPS
+    // FPS (smoothed)
     fpsAcc += 1/Math.max(dtRaw, 1e-6); fpsFrames++; fpsT += dtRaw;
-    if (fpsT > 0.5) { fpsEl.textContent = `${(fpsAcc/fpsFrames).toFixed(0)} fps`; fpsAcc=0; fpsFrames=0; fpsT=0; }
+    if (fpsT > 0.5) {
+      fpsEl.textContent = `${(fpsAcc/fpsFrames).toFixed(0)} fps`;
+      fpsAcc=0; fpsFrames=0; fpsT=0;
+    }
 
     requestAnimationFrame(draw);
   }
-  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
+
+  // Kick off
   requestAnimationFrame(draw);
 
-  // Nice little starting motion
+  // Nice starting shuffle
   setTimeout(()=> randomizeAll(), 250);
 })();
 </script>
