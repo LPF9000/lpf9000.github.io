@@ -52,6 +52,7 @@
   <div class="g"><label>Teleport</label><input id="tele" type="range" min="0" max="0.05" step="0.001" value="0.006"></div>
   <div class="g"><label>Edge Thicc</label><input id="thick" type="range" min="0.4" max="4" step="0.1" value="1.2"></div>
   <div class="g"><label>Warp (time)</label><input id="warp" type="range" min="0.1" max="3" step="0.01" value="1.0"></div>
+  <div class="g"><label>Fibo Hue Speed</label><input id="fiboSpeed" type="range" min="0" max="2" step="0.001" value="0.20"></div>
   <button id="random"  type="button">🎲 Randomize</button>
   <button id="pause"   type="button">⏸ Pause</button>
   <span id="fps"></span>
@@ -102,6 +103,7 @@
     tele:  $('#tele'),
     thick: $('#thick'),
     warp:  $('#warp'),
+    fiboSpeed: $('#fiboSpeed')
   };
 
   // State
@@ -110,6 +112,11 @@
   let last = performance.now();
   let timeScale = +UI.warp.value;
 
+  // Fibonacci color state
+  const GOLDEN_ANGLE = 137.50776405003785; // degrees
+  let hueBase = Math.random()*360;         // randomized on start
+  let huePhase = 0;                        // animated by fiboSpeed
+
   // FPS
   const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
 
@@ -117,15 +124,14 @@
   const rnd  = (a=1)=> Math.random()*a;
   const rndN = (n=1)=> (Math.random()*2-1)*n;
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  // Smoothstep for gentle attenuation
   const smooth = (e0,e1,x)=>{ const t=clamp((x-e0)/(e1-e0),0,1); return t*t*(3-2*t); };
 
   function makeNodes(N){
-    nodes = Array.from({length:N}, () => ({
+    nodes = Array.from({length:N}, (_,i) => ({
       x: rnd(W), y: rnd(H),
       vx: rndN(1.5), vy: rndN(1.5),
       r: 1.5 + Math.random()*3.5,
-      hue: (160 + Math.random()*200)|0
+      idx: i // store index for Fibonacci hue
     }));
   }
   makeNodes(+UI.nodes.value);
@@ -136,7 +142,7 @@
     timeScale = +UI.warp.value;
   }
 
-  // Randomize ALL sliders + palette + velocities
+  // Randomize ALL sliders + reseed motion + base hue
   function randomizeAll(){
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const min = parseFloat(inp.min), max = parseFloat(inp.max);
@@ -146,8 +152,9 @@
       inp.value = raw.toFixed(decimals);
     }
     applyFromSliders();
+    hueBase = Math.random()*360;
+    huePhase = 0;
     for (const n of nodes){
-      n.hue = (Math.random()*360)|0;
       const speed = 1.5 + Math.random()*3.0;
       const ang = Math.random()*Math.PI*2;
       n.vx = Math.cos(ang)*speed;
@@ -168,52 +175,50 @@
     const dt = dtRaw * timeScale;
 
     if (playing){
-      // --- 1) Trail (persistence) with curve mapping ---
-      // trailRaw 0..0.95 → map nonlinearly so low end has finer control
+      // --- Trails with curve ---
       const trailRaw = +UI.trail.value;
-      const tCurve = +UI.trailCurve.value;     // 0..1
-      // Exponent grows with curve → finer control near 0
-      const tExp = 1.2 + tCurve*3.0;           // ~1.2 .. 4.2
-      const trailA = Math.pow(trailRaw, tExp); // remapped alpha
+      const tCurve = +UI.trailCurve.value;
+      const tExp = 1.2 + tCurve*3.0;
+      const trailA = Math.pow(trailRaw, tExp);
       if (trailA <= 0.0001) ctx.clearRect(0,0,W,H);
       else { ctx.fillStyle = `rgba(0,0,0,${trailA})`; ctx.fillRect(0,0,W,H); }
 
-      // --- 2) Feedback echo with curve + trail-aware attenuation ---
-      const fbMix = +UI.feedback.value;        // 0..1 (user mix)
-      const fbC   = +UI.fbCurve.value;         // 0..1 (response shaping)
-      const fbWarp = +UI.fbWarp.value;         // 0..1 (transform strength)
-
-      // Saturating curve: alpha = 1 - exp(-k*x), where k grows with fbCurve.
-      const k = 1.5 + fbC*3.5;                 // ~1.5 .. 5.0
-      let fbAlpha = 1 - Math.exp(-k * fbMix);  // 0..~1, smooth near top
-      // Auto-attenuate when trail is low (to prevent blowout):
-      // As trailA→0, atten→0.25; as trailA→1, atten→1.0
+      // --- Feedback echo (screen blend) ---
+      const fbMix = +UI.feedback.value;
+      const fbC   = +UI.fbCurve.value;
+      const fbWarp = +UI.fbWarp.value;
+      const k = 1.5 + fbC*3.5;
+      let fbAlpha = 1 - Math.exp(-k * fbMix);
       const atten = 0.25 + 0.75 * smooth(0.0, 1.0, trailA);
-      fbAlpha = clamp(fbAlpha * atten * 0.9, 0, 0.95); // cap a bit below 1
-
+      fbAlpha = clamp(fbAlpha * atten * 0.9, 0, 0.95);
       if (fbAlpha > 0.001){
         ctx.save();
         ctx.globalAlpha = fbAlpha;
-        // gentler than 'lighter'; reduces additive blowouts
         ctx.globalCompositeOperation = 'screen';
         ctx.translate(W/2, H/2);
-        const s = 1 + fbWarp * 0.006;          // tiny scale
-        const r = fbWarp * 0.002;              // tiny rotation (radians-ish)
-        ctx.scale(s, s);
-        ctx.rotate(r);
+        const s = 1 + fbWarp * 0.006;
+        const r = fbWarp * 0.002;
+        ctx.scale(s, s); ctx.rotate(r);
         ctx.translate(-W/2, -H/2);
         ctx.drawImage(fb, 0, 0, W, H);
         ctx.restore();
         ctx.globalCompositeOperation = 'source-over';
       }
 
-      // --- 3) Simulation params ---
+      // --- Update Fibonacci hue phase ---
+      // fiboSpeed units: rotations-per-second of huePhase fraction (0..1)
+      const fiboSpeed = +UI.fiboSpeed.value; // 0..2
+      huePhase += fiboSpeed * dt * 360;      // degrees per second
+      // Keep huePhase bounded (not required, but tidy)
+      if (huePhase > 36000) huePhase -= 36000;
+
+      // --- Sim params ---
       const jitter = +UI.glitch.value;
       const teleP  = +UI.tele.value;
       const linkR  = +UI.radius.value;
       const thick  = +UI.thick.value;
 
-      // --- 4) Nodes update/draw ---
+      // --- Nodes ---
       for (const n of nodes){
         if (Math.random() < (0.8*jitter) * dt) {
           n.vx += rndN(80*jitter) * dt;
@@ -229,13 +234,16 @@
         if (n.y < 0) { n.y = 0; n.vy = Math.abs(n.vy); }
         if (n.y > H) { n.y = H; n.vy = -Math.abs(n.vy); }
 
+        // Fibonacci-based hue (automated)
+        const hue = (hueBase + n.idx * GOLDEN_ANGLE + huePhase) % 360;
+
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
-        ctx.fillStyle = `hsl(${n.hue},85%,${45 + Math.min(40, Math.hypot(n.vx,n.vy))}%)`;
+        ctx.fillStyle = `hsl(${hue},85%,${45 + Math.min(40, Math.hypot(n.vx,n.vy))}%)`;
         ctx.fill();
       }
 
-      // --- 5) Edges / scaffolding (two-pass) ---
+      // --- Edges / scaffolding ---
       const N = nodes.length;
       ctx.lineCap = 'round';
       for (let pass=0; pass<2; pass++){
@@ -249,9 +257,10 @@
             const reach = linkR * (pass?1.0:0.6);
             if (d < reach){
               const fade = 1 - d / reach;
-              ctx.strokeStyle = `rgba(${180+pass*40},${210-pass*20},255,${0.06 + fade*0.5})`;
+              // mid-segment warp tied a bit to huePhase for a tiny extra shimmer
               const mx = (a.x+b.x)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
               const my = (a.y+b.y)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
+              ctx.strokeStyle = `rgba(${180+pass*40},${210-pass*20},255,${0.06 + fade*0.5})`;
               ctx.beginPath();
               ctx.moveTo(a.x, a.y);
               ctx.lineTo(mx, my);
@@ -262,7 +271,7 @@
         }
       }
 
-      // --- 6) Update feedback buffer (snapshot current frame) ---
+      // Snapshot for feedback
       fbc.clearRect(0,0,W,H);
       fbc.drawImage(cv, 0, 0, W, H);
     }
@@ -279,11 +288,10 @@
 
   requestAnimationFrame(draw);
 
-  // Nice starting shuffle
+  // Tiny starting swirl: reseed motion & base hue
   setTimeout(() => {
-    // small nudge: randomize colors/vels but keep current slider values
+    hueBase = Math.random()*360;
     for (const n of nodes){
-      n.hue = (Math.random()*360)|0;
       const speed = 1.5 + Math.random()*3.0;
       const ang = Math.random()*Math.PI*2;
       n.vx = Math.cos(ang)*speed;
