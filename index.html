@@ -3,218 +3,75 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>micro-glitch</title>
+<title>glitch-network</title>
 <style>
-  :root { color-scheme: dark; }
-  html,body { margin:0; height:100%; background:#000; font-family: system-ui, sans-serif; }
-  #ui {
-    position: fixed; inset: 0 auto auto 0; margin: 12px; display:flex; gap:8px; flex-wrap:wrap;
-    background: rgba(0,0,0,.35); backdrop-filter: blur(6px); border:1px solid rgba(255,255,255,.08);
-    border-radius: 10px; padding:8px 10px; align-items:center;
-  }
-  button, label, input[type="range"] {
-    appearance: none; border:1px solid rgba(255,255,255,.2); background: rgba(255,255,255,.06);
-    color:#fff; padding:6px 10px; border-radius:8px; font-size:14px; cursor:pointer;
-  }
-  input[type="range"]{ width:140px; height:28px; cursor:ew-resize; }
-  #hint { color:#9ad; font-size:12px; opacity:.8; margin-left:6px }
+  html,body { margin:0; height:100%; background:#000; overflow:hidden; }
   canvas { display:block; width:100vw; height:100vh; }
-  #drop {
-    position:fixed; inset:0; display:none; place-items:center; color:#9ad; background:rgba(0,0,20,.75);
-    border:2px dashed #59f; font-size:18px; pointer-events:none;
-  }
-  .pill { font-size:12px; padding:4px 8px; border-radius:999px; opacity:.85 }
+  #ui { position:fixed; top:10px; left:10px; color:#fff; font-family:monospace; font-size:14px; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="drop">Drop an audio file anywhere…</div>
-
-<div id="ui">
-  <button id="mic">🎤 Use Mic</button>
-  <button id="file">🎵 Load Audio</button>
-  <label class="pill">Glitch <input id="glitch" type="range" min="0" max="1" step="0.01" value="0.6"></label>
-  <label class="pill">Intensity <input id="intensity" type="range" min="0" max="1.25" step="0.01" value="0.9"></label>
-  <label class="pill">Scanlines <input id="scan" type="range" min="0" max="1" step="0.01" value="0.35"></label>
-  <label class="pill">FX <input id="fx" type="range" min="0" max="1" step="0.01" value="0.5"></label>
-  <label class="pill">Volume <input id="vol" type="range" min="0" max="1" step="0.01" value="1"></label>
-  <label class="pill"><input id="mon" type="checkbox"> Monitor Mic</label>
-  <button id="pause">⏸ Pause</button>
-  <span id="hint">Tip: press <b>M</b> for mic, <b>O</b> to open file, drag an audio file onto the page.</span>
-</div>
-
+<div id="ui">🎵 Drop audio or press space for mic</div>
 <script>
-(() => {
-  const $ = sel => document.querySelector(sel);
-  const canvas = $('#c');
-  const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
-  const drop = $('#drop');
-  let W = 0, H = 0, DPR = Math.max(1, Math.min(window.devicePixelRatio||1, 2));
-  const resize = () => { W = canvas.width = Math.floor(innerWidth * DPR); H = canvas.height = Math.floor(innerHeight * DPR); };
-  addEventListener('resize', resize, { passive:true }); resize();
+const canvas=document.getElementById("c"),ctx=canvas.getContext("2d");
+let W,H,DPR=Math.max(1,Math.min(window.devicePixelRatio||1,2));
+function resize(){W=canvas.width=innerWidth*DPR;H=canvas.height=innerHeight*DPR;}
+addEventListener("resize",resize);resize();
 
-  let actx, analyser, master, srcNode, dataArray, playing = true, started = false, audioBufferSource = null;
-  const FFT_SIZE = 2048;
+// --- audio setup ---
+let actx,analyser,dataArray,srcNode,started=false;
+async function initAudioMic(){
+  if(!actx){actx=new AudioContext();analyser=actx.createAnalyser();analyser.fftSize=512;dataArray=new Uint8Array(analyser.frequencyBinCount);}
+  const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+  srcNode=actx.createMediaStreamSource(stream);srcNode.connect(analyser);started=true;
+}
+async function initAudioFile(file){
+  if(!actx){actx=new AudioContext();analyser=actx.createAnalyser();analyser.fftSize=512;dataArray=new Uint8Array(analyser.frequencyBinCount);}
+  const buf=await file.arrayBuffer();const audio=await actx.decodeAudioData(buf);
+  const bs=actx.createBufferSource();bs.buffer=audio;bs.loop=true;bs.connect(analyser);bs.connect(actx.destination);bs.start();started=true;
+}
+addEventListener("keydown",e=>{if(e.code==="Space"){initAudioMic();}});
+addEventListener("drop",e=>{e.preventDefault();if(e.dataTransfer.files[0])initAudioFile(e.dataTransfer.files[0]);});
+addEventListener("dragover",e=>e.preventDefault());
 
-  function ensureAudio() {
-    if (actx) return;
-    actx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
-    analyser = actx.createAnalyser();
-    analyser.fftSize = FFT_SIZE;
-    analyser.smoothingTimeConstant = 0.85;
-    dataArray = new Uint8Array(analyser.frequencyBinCount);
-    master = actx.createGain();
-    master.gain.value = +$('#vol').value;     // volume slider controls output
-    master.connect(actx.destination);         // connect to speakers
-    $('#vol').oninput = () => master.gain.value = +$('#vol').value;
+// --- particles ---
+const N=120, nodes=[];
+for(let i=0;i<N;i++){nodes.push({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-0.5)*2,vy:(Math.random()-0.5)*2,r:2+Math.random()*3});}
+
+function stepAudio(){
+  if(!started) return 0;
+  analyser.getByteFrequencyData(dataArray);
+  let avg=0;for(let i=0;i<dataArray.length;i++)avg+=dataArray[i];avg/=dataArray.length;
+  return avg/255; // 0..1
+}
+
+function draw(){
+  ctx.fillStyle="rgba(0,0,0,0.25)";ctx.fillRect(0,0,W,H);
+  let energy=stepAudio();
+  for(let n of nodes){
+    // jitter / glitch
+    if(Math.random()<0.02+energy*0.05){n.vx+=(Math.random()-0.5)*8*energy;n.vy+=(Math.random()-0.5)*8*energy;}
+    n.x+=n.vx;n.y+=n.vy;
+    if(n.x<0||n.x>W){n.vx*=-1;}
+    if(n.y<0||n.y>H){n.vy*=-1;}
+    // draw node
+    ctx.beginPath();ctx.arc(n.x,n.y,n.r,0,Math.PI*2);
+    ctx.fillStyle=`hsl(${200+energy*160},80%,${50+energy*40}%)`;
+    ctx.fill();
   }
-
-  async function useMic() {
-    ensureAudio();
-    stopAudioBuffer();
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    srcNode = actx.createMediaStreamSource(stream);
-    srcNode.connect(analyser);
-    // Mic monitor OFF by default to prevent feedback.
-    toggleMicMonitor();
-    started = true;
-  }
-
-  function toggleMicMonitor() {
-    // Disconnect any previous monitor connection
-    try { analyser.disconnect(); } catch(_) {}
-    analyser.connect(master); // always connect to master for file playback
-    if (!$('#mon').checked && srcNode && srcNode.mediaStream) {
-      // For mic with monitor off: analyser → master still carries visuals,
-      // but since only analyser is connected to master, we still hear mic
-      // unless we block it. So create a separate path:
-      // We'll mute mic monitoring by NOT connecting the mic directly to master.
-      // (We already connect srcNode -> analyser; analyser -> master is fine.)
-      // Some browsers might leak; if you still hear feedback, set master.gain low while mic is active.
+  // draw edges
+  ctx.lineWidth=1+energy*2;ctx.strokeStyle=`rgba(180,200,255,${0.2+energy*0.5})`;
+  for(let i=0;i<N;i++){for(let j=i+1;j<N;j++){
+    let dx=nodes[i].x-nodes[j].x,dy=nodes[i].y-nodes[j].y,dist=Math.hypot(dx,dy);
+    if(dist<120+energy*200){
+      ctx.globalAlpha=1-dist/(200+energy*300);
+      ctx.beginPath();ctx.moveTo(nodes[i].x,nodes[i].y);ctx.lineTo(nodes[j].x,nodes[j].y);ctx.stroke();
     }
-  }
-
-  async function useFile(file) {
-    ensureAudio();
-    stopAudioBuffer();
-    const ab = await file.arrayBuffer();
-    const buf = await actx.decodeAudioData(ab);
-    audioBufferSource = actx.createBufferSource();
-    audioBufferSource.buffer = buf;
-    audioBufferSource.loop = true;
-    // Chain: file → analyser → master → speakers
-    audioBufferSource.connect(analyser);
-    analyser.connect(master);
-    audioBufferSource.start();
-    started = true;
-  }
-
-  function stopAudioBuffer() {
-    if (audioBufferSource) { try { audioBufferSource.stop(); } catch(_){} audioBufferSource.disconnect(); audioBufferSource = null; }
-    if (srcNode) { try { srcNode.disconnect(); } catch(_){} srcNode = null; }
-  }
-
-  // UI wiring
-  $('#mic').onclick = () => useMic().catch(console.error);
-  $('#file').onclick = () => {
-    const inp = document.createElement('input');
-    inp.type = 'file';
-    inp.accept = '.mp3,.wav,.ogg,.flac,.aac,.m4a';
-    inp.onchange = e => { if (inp.files && inp.files[0]) useFile(inp.files[0]); };
-    inp.click();
-  };
-  $('#pause').onclick = () => { playing = !playing; $('#pause').textContent = playing ? '⏸ Pause' : '▶️ Play'; };
-  $('#mon').oninput = toggleMicMonitor;
-
-  addEventListener('keydown', (e) => {
-    if (e.key.toLowerCase() === 'm') $('#mic').click();
-    if (e.key.toLowerCase() === 'o') $('#file').click();
-    if (e.key === ' ') { e.preventDefault(); $('#pause').click(); }
-  });
-
-  // drag & drop
-  let dragCount = 0;
-  addEventListener('dragenter', (e) => { e.preventDefault(); dragCount++; drop.style.display='grid'; });
-  addEventListener('dragleave', (e) => { e.preventDefault(); dragCount=Math.max(0, dragCount-1); if(!dragCount) drop.style.display='none'; });
-  addEventListener('dragover', (e) => e.preventDefault());
-  addEventListener('drop', (e) => {
-    e.preventDefault(); dragCount=0; drop.style.display='none';
-    const f = e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f) useFile(f);
-  });
-
-  // visuals
-  const params = {
-    glitch: $('#glitch'),
-    intensity: $('#intensity'),
-    scan: $('#scan'),
-    fx: $('#fx')
-  };
-
-  let t0 = performance.now();
-  function draw(now) {
-    const dt = (now - t0) / 1000; t0 = now;
-    if (playing) {
-      const time = now * 0.00025;
-      const g = ctx.createLinearGradient(0, 0, W, H);
-      g.addColorStop(0,   `hsl(${(time*120)%360} 80% 50%)`);
-      g.addColorStop(0.5, `hsl(${(time*120+120)%360} 80% 35%)`);
-      g.addColorStop(1,   `hsl(${(time*120+240)%360} 80% 15%)`);
-      ctx.fillStyle = g;
-      ctx.fillRect(0,0,W,H);
-
-      let energy = 0, bass = 0;
-      if (started && analyser) {
-        analyser.getByteFrequencyData(dataArray);
-        for (let i=0;i<dataArray.length;i++) energy += dataArray[i];
-        energy /= (dataArray.length*255);
-        const bassBins = Math.max(8, (dataArray.length/10)|0);
-        for (let i=0;i<bassBins;i++) bass += dataArray[i];
-        bass /= (bassBins*255);
-      }
-
-      const fx = +params.fx.value;
-      const shift = (2 + 10*fx) * (0.2 + energy);
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.globalAlpha = 0.5;
-      ctx.drawImage(canvas, shift, 0, W, H, 0, 0, W, H);
-      ctx.drawImage(canvas, 0, shift, W, H, 0, 0, W, H);
-      ctx.drawImage(canvas, -shift, 0, W, H, 0, 0, W, H);
-      ctx.globalAlpha = 1.0;
-      ctx.globalCompositeOperation = 'source-over';
-
-      const gAmt = +params.glitch.value;
-      const intensity = +params.intensity.value;
-      const slices = Math.floor(2 + 24 * gAmt * (0.3 + energy));
-      for (let i=0;i<slices;i++) {
-        if (Math.random() > (0.3 + gAmt*0.7) * (0.25 + energy*0.75)) continue;
-        const h = Math.max(1, (Math.random()**2) * (H*0.08));
-        const y = Math.floor(Math.random() * (H - h));
-        const xShift = Math.floor((Math.random() * 2 - 1) * (W * 0.08 * intensity) * (0.2 + bass*1.6));
-        ctx.drawImage(canvas, 0, y, W, h, xShift, y, W, h);
-      }
-
-      const scan = +params.scan.value;
-      if (scan > 0) {
-        ctx.globalAlpha = 0.12 * scan;
-        for (let y=0; y<H; y+=2) { ctx.fillStyle = '#000'; ctx.fillRect(0,y,W,1); }
-        ctx.globalAlpha = 1.0;
-      }
-
-      ctx.fillStyle = 'rgba(0,0,0,0.08)';
-      ctx.fillRect(0,0,W,10);
-      ctx.fillRect(0,H-10,W,10);
-      ctx.fillRect(0,0,10,H);
-      ctx.fillRect(W-10,0,10,H);
-    }
-    requestAnimationFrame(draw);
-  }
+  }}ctx.globalAlpha=1;
   requestAnimationFrame(draw);
-
-  // Autoplay policies: resume AudioContext on first user gesture
-  const resume = () => { if (actx && actx.state === 'suspended') actx.resume(); removeEventListener('pointerdown', resume); };
-  addEventListener('pointerdown', resume, { passive:true });
-})();
+}
+draw();
 </script>
 </body>
 </html>
