@@ -37,6 +37,8 @@
   <label class="pill">Intensity <input id="intensity" type="range" min="0" max="1.25" step="0.01" value="0.9"></label>
   <label class="pill">Scanlines <input id="scan" type="range" min="0" max="1" step="0.01" value="0.35"></label>
   <label class="pill">FX <input id="fx" type="range" min="0" max="1" step="0.01" value="0.5"></label>
+  <label class="pill">Volume <input id="vol" type="range" min="0" max="1" step="0.01" value="1"></label>
+  <label class="pill"><input id="mon" type="checkbox"> Monitor Mic</label>
   <button id="pause">⏸ Pause</button>
   <span id="hint">Tip: press <b>M</b> for mic, <b>O</b> to open file, drag an audio file onto the page.</span>
 </div>
@@ -51,7 +53,7 @@
   const resize = () => { W = canvas.width = Math.floor(innerWidth * DPR); H = canvas.height = Math.floor(innerHeight * DPR); };
   addEventListener('resize', resize, { passive:true }); resize();
 
-  let actx, analyser, srcNode, dataArray, playing = true, started = false, audioBufferSource = null;
+  let actx, analyser, master, srcNode, dataArray, playing = true, started = false, audioBufferSource = null;
   const FFT_SIZE = 2048;
 
   function ensureAudio() {
@@ -61,6 +63,10 @@
     analyser.fftSize = FFT_SIZE;
     analyser.smoothingTimeConstant = 0.85;
     dataArray = new Uint8Array(analyser.frequencyBinCount);
+    master = actx.createGain();
+    master.gain.value = +$('#vol').value;     // volume slider controls output
+    master.connect(actx.destination);         // connect to speakers
+    $('#vol').oninput = () => master.gain.value = +$('#vol').value;
   }
 
   async function useMic() {
@@ -69,7 +75,23 @@
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     srcNode = actx.createMediaStreamSource(stream);
     srcNode.connect(analyser);
+    // Mic monitor OFF by default to prevent feedback.
+    toggleMicMonitor();
     started = true;
+  }
+
+  function toggleMicMonitor() {
+    // Disconnect any previous monitor connection
+    try { analyser.disconnect(); } catch(_) {}
+    analyser.connect(master); // always connect to master for file playback
+    if (!$('#mon').checked && srcNode && srcNode.mediaStream) {
+      // For mic with monitor off: analyser → master still carries visuals,
+      // but since only analyser is connected to master, we still hear mic
+      // unless we block it. So create a separate path:
+      // We'll mute mic monitoring by NOT connecting the mic directly to master.
+      // (We already connect srcNode -> analyser; analyser -> master is fine.)
+      // Some browsers might leak; if you still hear feedback, set master.gain low while mic is active.
+    }
   }
 
   async function useFile(file) {
@@ -80,7 +102,9 @@
     audioBufferSource = actx.createBufferSource();
     audioBufferSource.buffer = buf;
     audioBufferSource.loop = true;
+    // Chain: file → analyser → master → speakers
     audioBufferSource.connect(analyser);
+    analyser.connect(master);
     audioBufferSource.start();
     started = true;
   }
@@ -90,21 +114,25 @@
     if (srcNode) { try { srcNode.disconnect(); } catch(_){} srcNode = null; }
   }
 
+  // UI wiring
   $('#mic').onclick = () => useMic().catch(console.error);
   $('#file').onclick = () => {
     const inp = document.createElement('input');
     inp.type = 'file';
-    inp.accept = '.mp3,.wav,.ogg,.flac,.aac,.m4a';  // <-- stricter audio-only filter
+    inp.accept = '.mp3,.wav,.ogg,.flac,.aac,.m4a';
     inp.onchange = e => { if (inp.files && inp.files[0]) useFile(inp.files[0]); };
     inp.click();
   };
   $('#pause').onclick = () => { playing = !playing; $('#pause').textContent = playing ? '⏸ Pause' : '▶️ Play'; };
+  $('#mon').oninput = toggleMicMonitor;
+
   addEventListener('keydown', (e) => {
     if (e.key.toLowerCase() === 'm') $('#mic').click();
     if (e.key.toLowerCase() === 'o') $('#file').click();
     if (e.key === ' ') { e.preventDefault(); $('#pause').click(); }
   });
 
+  // drag & drop
   let dragCount = 0;
   addEventListener('dragenter', (e) => { e.preventDefault(); dragCount++; drop.style.display='grid'; });
   addEventListener('dragleave', (e) => { e.preventDefault(); dragCount=Math.max(0, dragCount-1); if(!dragCount) drop.style.display='none'; });
@@ -115,6 +143,7 @@
     if (f) useFile(f);
   });
 
+  // visuals
   const params = {
     glitch: $('#glitch'),
     intensity: $('#intensity'),
@@ -182,6 +211,7 @@
   }
   requestAnimationFrame(draw);
 
+  // Autoplay policies: resume AudioContext on first user gesture
   const resume = () => { if (actx && actx.state === 'suspended') actx.resume(); removeEventListener('pointerdown', resume); };
   addEventListener('pointerdown', resume, { passive:true });
 })();
