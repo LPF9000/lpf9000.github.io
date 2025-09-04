@@ -144,28 +144,29 @@
     timeScale = +UI.warp.value;
   }
 
-  // Randomize ALL sliders with constraints for trail & radius
+  // Randomize ALL sliders with new constraints:
+  // - trail: 50%..95% of its range
+  // - radius: 0..50% of its range
   function randomizeAll(){
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const id = inp.id;
+      const min = parseFloat(inp.min), max = parseFloat(inp.max);
+      const span = max - min;
+
       if (id === 'trail') {
-        // Constrain trail to 60–90%
-        const val = 0.60 + Math.random()*0.30; // 0.60..0.90
-        inp.value = Math.min(val, parseFloat(inp.max)).toFixed(2);
+        const val = min + 0.50*span + Math.random()*(0.45*span); // 50%-95%
+        inp.value = (+val).toFixed(2);
         continue;
       }
       if (id === 'radius') {
-        // Constrain radius to 0–40% of its range
-        const min = parseFloat(inp.min), max = parseFloat(inp.max);
-        const span = max - min;
-        const val = min + Math.random() * (0.40 * span);
-        inp.value = Math.round(val);
+        const val = min + Math.random()*(0.50*span);            // 0%-50%
+        // keep step alignment
+        inp.value = Math.round(val / parseFloat(inp.step || 1)) * (parseFloat(inp.step || 1));
         continue;
       }
-      // Default: full-range randomization aligned to step
-      const min = parseFloat(inp.min), max = parseFloat(inp.max);
+      // Default: full range
       const step = parseFloat(inp.step || '1');
-      const raw = min + Math.random()*(max-min);
+      const raw = min + Math.random()*(span);
       const decimals = (step.toString().split('.')[1]||'').length;
       inp.value = raw.toFixed(decimals);
     }
@@ -228,14 +229,12 @@
       }
 
       /* Update Fibonacci phases */
-      const fiboSpeed = +UI.fiboSpeed.value;           // nodes (continuous)
-      huePhase += fiboSpeed * dt * 360;
+      const fiboSpeed = +UI.fiboSpeed.value;
+      huePhase += fiboSpeed * dt * 360;      // nodes continuous
       if (huePhase > 36000) huePhase -= 36000;
 
-      // Edges phase: step in chunks for jumpy color changes
-      // Higher speed -> faster stepping; step size in degrees for quantization
-      edgePhase += fiboSpeed * dt * 360;
-      const EDGE_STEP_DEG = 24;                        // quantization size
+      edgePhase += fiboSpeed * dt * 360;     // edges stepped
+      const EDGE_STEP_DEG = 24;
       const edgePhaseQ = Math.floor(edgePhase / EDGE_STEP_DEG) * EDGE_STEP_DEG;
 
       /* Sim params */
@@ -267,16 +266,13 @@
         ctx.fill();
       }
 
-      /* Edges (two-pass) — per-connection Fibonacci color with jumpy phase */
+      /* Edges (two-pass) — colored, not white */
       const N = nodes.length;
       ctx.lineCap = 'round';
       for (let pass=0; pass<2; pass++){
-        // softer alpha to avoid white-out when many edges overlap
-        const baseAlpha = pass ? 0.06 : 0.03;
-        const alphaScale = pass ? 0.25 : 0.18;
         ctx.lineWidth = (thick * (pass?1:0.5));
 
-        let edgeIdx = 0; // index across all connections this pass
+        let edgeIdx = 0;
         for (let i=0;i<N;i++){
           const a = nodes[i];
           for (let j=i+1;j<N;j++, edgeIdx++){
@@ -287,17 +283,20 @@
             if (d < reach){
               const fade = 1 - d / reach;
 
-              // Per-connection Fibonacci hue (jumpy)
-              const ehue = (edgeBase + edgeIdx*GOLDEN_ANGLE + edgePhaseQ) % 360;
+              // Per-connection Fibonacci hue with jump steps
+              const ehue = (edgeBase + edgeIdx * GOLDEN_ANGLE + edgePhaseQ) % 360;
 
-              // Per-edge alpha, gentle and distance-weighted
-              const aEdge = clamp(baseAlpha + alphaScale * fade, 0, 0.35);
+              // Softer alpha to avoid washout, but keep visible color
+              const baseAlpha = pass ? 0.12 : 0.06;     // higher than before for color presence
+              const alphaScale = pass ? 0.35 : 0.25;    // scaled by distance fade
+              const aEdge = clamp(baseAlpha + alphaScale * fade, 0, 0.55);
 
-              // Slight mid-segment warp for glitch feel
+              // Slight mid-segment warp
               const mx = (a.x+b.x)/2 + rndN(6 + 30*fade) * dt * 60;
               const my = (a.y+b.y)/2 + rndN(6 + 30*fade) * dt * 60;
 
-              ctx.strokeStyle = `hsla(${ehue},85%,70%,${aEdge})`;
+              // Strong saturation, mid lightness for vivid color (not white)
+              ctx.strokeStyle = `hsla(${ehue}, 95%, 55%, ${aEdge})`;
               ctx.beginPath();
               ctx.moveTo(a.x, a.y);
               ctx.lineTo(mx, my);
