@@ -114,8 +114,10 @@
 
   // Fibonacci color state
   const GOLDEN_ANGLE = 137.50776405003785; // degrees
-  let hueBase = Math.random()*360;         // randomized on start
-  let huePhase = 0;                        // animated by fiboSpeed
+  let hueBase = Math.random()*360;
+  let huePhase = 0;            // for nodes (continuous)
+  let edgeBase = Math.random()*360;
+  let edgePhase = 0;           // for edges (quantized)
 
   // FPS
   const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
@@ -131,7 +133,7 @@
       x: rnd(W), y: rnd(H),
       vx: rndN(1.5), vy: rndN(1.5),
       r: 1.5 + Math.random()*3.5,
-      idx: i // store index for Fibonacci hue
+      idx: i
     }));
   }
   makeNodes(+UI.nodes.value);
@@ -142,9 +144,25 @@
     timeScale = +UI.warp.value;
   }
 
-  // Randomize ALL sliders + reseed motion + base hue
+  // Randomize ALL sliders with constraints for trail & radius
   function randomizeAll(){
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
+      const id = inp.id;
+      if (id === 'trail') {
+        // Constrain trail to 60–90%
+        const val = 0.60 + Math.random()*0.30; // 0.60..0.90
+        inp.value = Math.min(val, parseFloat(inp.max)).toFixed(2);
+        continue;
+      }
+      if (id === 'radius') {
+        // Constrain radius to 0–40% of its range
+        const min = parseFloat(inp.min), max = parseFloat(inp.max);
+        const span = max - min;
+        const val = min + Math.random() * (0.40 * span);
+        inp.value = Math.round(val);
+        continue;
+      }
+      // Default: full-range randomization aligned to step
       const min = parseFloat(inp.min), max = parseFloat(inp.max);
       const step = parseFloat(inp.step || '1');
       const raw = min + Math.random()*(max-min);
@@ -152,8 +170,12 @@
       inp.value = raw.toFixed(decimals);
     }
     applyFromSliders();
+
+    // Reseed palettes & motion
     hueBase = Math.random()*360;
+    edgeBase = Math.random()*360;
     huePhase = 0;
+    edgePhase = 0;
     for (const n of nodes){
       const speed = 1.5 + Math.random()*3.0;
       const ang = Math.random()*Math.PI*2;
@@ -175,7 +197,7 @@
     const dt = dtRaw * timeScale;
 
     if (playing){
-      // --- Trails with curve ---
+      /* Trails with curve */
       const trailRaw = +UI.trail.value;
       const tCurve = +UI.trailCurve.value;
       const tExp = 1.2 + tCurve*3.0;
@@ -183,7 +205,7 @@
       if (trailA <= 0.0001) ctx.clearRect(0,0,W,H);
       else { ctx.fillStyle = `rgba(0,0,0,${trailA})`; ctx.fillRect(0,0,W,H); }
 
-      // --- Feedback echo (screen blend) ---
+      /* Feedback echo (screen blend) */
       const fbMix = +UI.feedback.value;
       const fbC   = +UI.fbCurve.value;
       const fbWarp = +UI.fbWarp.value;
@@ -205,20 +227,24 @@
         ctx.globalCompositeOperation = 'source-over';
       }
 
-      // --- Update Fibonacci hue phase ---
-      // fiboSpeed units: rotations-per-second of huePhase fraction (0..1)
-      const fiboSpeed = +UI.fiboSpeed.value; // 0..2
-      huePhase += fiboSpeed * dt * 360;      // degrees per second
-      // Keep huePhase bounded (not required, but tidy)
+      /* Update Fibonacci phases */
+      const fiboSpeed = +UI.fiboSpeed.value;           // nodes (continuous)
+      huePhase += fiboSpeed * dt * 360;
       if (huePhase > 36000) huePhase -= 36000;
 
-      // --- Sim params ---
+      // Edges phase: step in chunks for jumpy color changes
+      // Higher speed -> faster stepping; step size in degrees for quantization
+      edgePhase += fiboSpeed * dt * 360;
+      const EDGE_STEP_DEG = 24;                        // quantization size
+      const edgePhaseQ = Math.floor(edgePhase / EDGE_STEP_DEG) * EDGE_STEP_DEG;
+
+      /* Sim params */
       const jitter = +UI.glitch.value;
       const teleP  = +UI.tele.value;
       const linkR  = +UI.radius.value;
       const thick  = +UI.thick.value;
 
-      // --- Nodes ---
+      /* Nodes */
       for (const n of nodes){
         if (Math.random() < (0.8*jitter) * dt) {
           n.vx += rndN(80*jitter) * dt;
@@ -234,33 +260,44 @@
         if (n.y < 0) { n.y = 0; n.vy = Math.abs(n.vy); }
         if (n.y > H) { n.y = H; n.vy = -Math.abs(n.vy); }
 
-        // Fibonacci-based hue (automated)
         const hue = (hueBase + n.idx * GOLDEN_ANGLE + huePhase) % 360;
-
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
         ctx.fillStyle = `hsl(${hue},85%,${45 + Math.min(40, Math.hypot(n.vx,n.vy))}%)`;
         ctx.fill();
       }
 
-      // --- Edges / scaffolding ---
+      /* Edges (two-pass) — per-connection Fibonacci color with jumpy phase */
       const N = nodes.length;
       ctx.lineCap = 'round';
       for (let pass=0; pass<2; pass++){
+        // softer alpha to avoid white-out when many edges overlap
+        const baseAlpha = pass ? 0.06 : 0.03;
+        const alphaScale = pass ? 0.25 : 0.18;
         ctx.lineWidth = (thick * (pass?1:0.5));
+
+        let edgeIdx = 0; // index across all connections this pass
         for (let i=0;i<N;i++){
           const a = nodes[i];
-          for (let j=i+1;j<N;j++){
+          for (let j=i+1;j<N;j++, edgeIdx++){
             const b = nodes[j];
             const dx = a.x - b.x, dy = a.y - b.y;
             const d = Math.hypot(dx,dy);
             const reach = linkR * (pass?1.0:0.6);
             if (d < reach){
               const fade = 1 - d / reach;
-              // mid-segment warp tied a bit to huePhase for a tiny extra shimmer
-              const mx = (a.x+b.x)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
-              const my = (a.y+b.y)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
-              ctx.strokeStyle = `rgba(${180+pass*40},${210-pass*20},255,${0.06 + fade*0.5})`;
+
+              // Per-connection Fibonacci hue (jumpy)
+              const ehue = (edgeBase + edgeIdx*GOLDEN_ANGLE + edgePhaseQ) % 360;
+
+              // Per-edge alpha, gentle and distance-weighted
+              const aEdge = clamp(baseAlpha + alphaScale * fade, 0, 0.35);
+
+              // Slight mid-segment warp for glitch feel
+              const mx = (a.x+b.x)/2 + rndN(6 + 30*fade) * dt * 60;
+              const my = (a.y+b.y)/2 + rndN(6 + 30*fade) * dt * 60;
+
+              ctx.strokeStyle = `hsla(${ehue},85%,70%,${aEdge})`;
               ctx.beginPath();
               ctx.moveTo(a.x, a.y);
               ctx.lineTo(mx, my);
@@ -271,7 +308,7 @@
         }
       }
 
-      // Snapshot for feedback
+      /* Snapshot for feedback */
       fbc.clearRect(0,0,W,H);
       fbc.drawImage(cv, 0, 0, W, H);
     }
@@ -288,9 +325,10 @@
 
   requestAnimationFrame(draw);
 
-  // Tiny starting swirl: reseed motion & base hue
+  // Small starting motion
   setTimeout(() => {
     hueBase = Math.random()*360;
+    edgeBase = Math.random()*360;
     for (const n of nodes){
       const speed = 1.5 + Math.random()*3.0;
       const ang = Math.random()*Math.PI*2;
