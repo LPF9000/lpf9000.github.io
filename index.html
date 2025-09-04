@@ -6,16 +6,29 @@
 <title>glitch-mesh — psychedelic</title>
 <style>
   :root { color-scheme: dark; }
-  html,body { margin:0; height:100%; background:#000; }
+  html,body { margin:0; height:100%; background:#000; overflow:hidden; }
   canvas { display:block; width:100vw; height:100vh; touch-action:none; }
 
+  /* Bottom drawer: slides up, scrolls internally if tall */
   #ui {
-    position:fixed; top:10px; left:50%; transform:translateX(-50%);
+    position:fixed;
+    left:50%;
+    bottom:58px;                   /* sits above the toggle pill */
+    transform:translate(-50%, 12px); /* slightly below (hidden-ish) when closed */
+    width:min(1200px, 100vw - 20px);
+    max-height:65vh;               /* drawer height cap */
+    overflow-y:auto;               /* scroll inside */
     display:flex; gap:10px; flex-wrap:wrap; align-items:center;
-    background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.2);
-    border-radius:12px; padding:10px 12px; font:14px system-ui, sans-serif; color:#fff;
-    max-width:min(1200px, calc(100vw - 20px)); z-index:10;
+    background:rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.25);
+    border-radius:14px; padding:10px 12px; font:14px system-ui, sans-serif; color:#fff;
+    box-shadow:0 8px 30px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.06) inset;
+    z-index:10;
+    transition: transform .25s ease, opacity .25s ease;
+    opacity:.0; pointer-events:none;
+    -webkit-overflow-scrolling: touch;
   }
+  #ui.open { transform:translate(-50%, 0); opacity:1; pointer-events:auto; }
+
   .g { display:flex; flex-direction:column; gap:2px; }
   .g label { font-size:12px; opacity:.85 }
   .g input[type="range"] { width:140px; }
@@ -26,18 +39,22 @@
   }
   #fps { font-size:12px; color:#9ad; opacity:.85; margin-left:4px }
 
+  /* Bottom toggle pill */
   #uiToggleWrap {
     position:fixed; left:50%; bottom:10px; transform:translateX(-50%);
-    background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.2);
+    background:rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.25);
     border-radius:999px; padding:8px 12px; color:#fff; font:13px system-ui,sans-serif;
-    display:flex; align-items:center; gap:8px; z-index:10;
+    display:flex; align-items:center; gap:8px; z-index:11;
+    box-shadow:0 4px 16px rgba(0,0,0,.4);
+    user-select:none;
   }
-  #uiToggle { width:18px; height:18px; }
+  #uiToggle { width:18px; height:18px; accent-color:#7fb0ff; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 
+<!-- Bottom drawer controls -->
 <div id="ui">
   <!-- Structure -->
   <div class="g"><label>Nodes</label><input id="nodes" type="range" min="40" max="500" step="10" value="160"></div>
@@ -59,7 +76,7 @@
   <!-- Color -->
   <div class="g"><label>Fibo Hue Speed</label><input id="fiboSpeed" type="range" min="0" max="2" step="0.001" value="0.20"></div>
 
-  <!-- Psychedelia / Sacred geometry field -->
+  <!-- Psychedelia field -->
   <div class="g"><label>PSY On</label><input id="psyOn" type="checkbox" checked></div>
   <div class="g"><label>Psy Influence</label><input id="psyInf" type="range" min="0" max="1.5" step="0.01" value="0.6"></div>
   <div class="g"><label>Symmetry</label><input id="psySym" type="range" min="2" max="16" step="1" value="6"></div>
@@ -73,6 +90,7 @@
   <span id="fps"></span>
 </div>
 
+<!-- Bottom toggle pill -->
 <div id="uiToggleWrap">
   <input id="uiToggle" type="checkbox" checked>
   <label for="uiToggle">Show controls</label>
@@ -97,22 +115,33 @@
   }
   addEventListener('resize', resize, {passive:true}); resize();
 
-  // UI show/hide
+  // Drawer open/close
   const panel = $('#ui');
   const toggle = $('#uiToggle');
-  toggle.addEventListener('change', () => {
-    panel.style.display = toggle.checked ? 'flex' : 'none';
-  });
+  function syncDrawer(){ panel.classList.toggle('open', toggle.checked); }
+  toggle.addEventListener('change', syncDrawer);
+  syncDrawer(); // initialize
 
   // Sliders
   const UI = {
-    nodes: $('#nodes'), radius: $('#radius'), thick: $('#thick'),
-    glitch: $('#glitch'), tele: $('#tele'), warp: $('#warp'),
-    trail: $('#trail'), trailCurve: $('#trailCurve'),
-    feedback: $('#feedback'), fbCurve: $('#fbCurve'), fbWarp: $('#fbWarp'),
+    nodes: $('#nodes'),
+    radius: $('#radius'),
+    trail: $('#trail'),
+    trailCurve: $('#trailCurve'),
+    feedback: $('#feedback'),
+    fbCurve: $('#fbCurve'),
+    fbWarp: $('#fbWarp'),
+    glitch: $('#glitch'),
+    tele:  $('#tele'),
+    thick: $('#thick'),
+    warp:  $('#warp'),
     fiboSpeed: $('#fiboSpeed'),
-    psyOn: $('#psyOn'), psyInf: $('#psyInf'), psySym: $('#psySym'),
-    psyFreq: $('#psyFreq'), psyLayers: $('#psyLayers'), psyFlow: $('#psyFlow')
+    psyOn: $('#psyOn'),
+    psyInf: $('#psyInf'),
+    psySym: $('#psySym'),
+    psyFreq: $('#psyFreq'),
+    psyLayers: $('#psyLayers'),
+    psyFlow: $('#psyFlow')
   };
 
   // State
@@ -135,57 +164,35 @@
   const rnd  = (a=1)=> Math.random()*a;
   const rndN = (n=1)=> (Math.random()*2-1)*n;
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  const smooth = (e0,e1,x)=>{ const t=clamp((x-e0)/(e1-e0),0,1); return t*t*(3-2*t); };
 
-  // Sacred-geometry-ish field: kaleidoscopic layered waves
+  // Sacred-geometry-ish field
   function fieldValue(x, y, t, sym, freq, layers){
-    // Normalize coords around center in [-1,1] space (aspect-correct)
     const sx = (x - W/2) / Math.max(W,H);
     const sy = (y - H/2) / Math.max(W,H);
-
-    let vx = sx, vy = sy;
-    let v = 0.0, s = 1.0, rot = 0.0;
-
-    const k = Math.max(2, sym|0);                 // symmetry wedges
-    const twopi = Math.PI*2;
-
-    // a few layers of folding + ripples
+    let vx = sx, vy = sy, v = 0.0, s = 1.0, rot = 0.0;
+    const k = Math.max(2, sym|0), twopi = Math.PI*2;
     for (let i=0;i<layers;i++){
-      // kaleidoscope fold
-      const ang = Math.atan2(vy,vx);
-      const rad = Math.hypot(vx,vy);
+      const ang = Math.atan2(vy,vx), rad = Math.hypot(vx,vy);
       let wedge = ((ang % (twopi/k)) + twopi/k) % (twopi/k);
-      let a = Math.abs(wedge - (twopi/k)/2);      // mirrored angle within wedge
-
-      // ripple with scale + tiny rotation drift
+      let a = Math.abs(wedge - (twopi/k)/2);
       rot += 0.15;
       const c = Math.cos(rot), srot = Math.sin(rot);
       const rx = vx*c - vy*srot, ry = vx*srot + vy*c;
-
-      // accumulate sin waves; freq increases with layer
       v += Math.sin((rad*freq*s) - t*0.9 + a*2.4 + i*1.3) * (0.6/(i+1));
       v += Math.sin((rx*freq*1.7*s) + (ry*freq*1.3*s) + t*0.4 + i*0.7) * (0.4/(i+1));
-
-      // zoom in for next layer
       vx *= 1.9; vy *= 1.9; s *= 1.35;
     }
-    return v; // roughly -something..+something
+    return v;
   }
-
-  // Gradient (finite diff) to nudge nodes along field without hard walls
   function fieldForce(x, y, t, sym, freq, layers){
     const eps = 0.002 * Math.max(W,H);
     const f0 = fieldValue(x, y, t, sym, freq, layers);
     const fx = fieldValue(x+eps, y, t, sym, freq, layers);
     const fy = fieldValue(x, y+eps, t, sym, freq, layers);
-    // negative gradient (towards decreasing field) + a tangential swirl
     let gx = (fx - f0)/eps, gy = (fy - f0)/eps;
-    // normalize a bit
     const g = Math.hypot(gx,gy) + 1e-6;
     gx /= g; gy /= g;
-    // swirl component rotates the gradient 90°
-    const swirl = 0.6;
-    const sxF = -gy*swirl, syF = gx*swirl;
+    const swirl = 0.6; const sxF = -gy*swirl, syF = gx*swirl;
     return { fx: gx + sxF, fy: gy + syF, fval: f0 };
   }
 
@@ -205,26 +212,23 @@
     timeScale = +UI.warp.value;
   }
 
-  // Randomize with constraints:
-  // - trail: 50%..95% of its range
-  // - radius: 0..50% of its range
+  // Randomize with constraints (trail ≥50% of range, radius ≤50% of range)
   function randomizeAll(){
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const id = inp.id;
       const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
       const span = max - min;
 
-      if (id === 'trail') {
+      if (id === 'trail') { // 50–95%
         const val = min + 0.50*span + Math.random()*(0.45*span);
         inp.value = (+val).toFixed(2);
         continue;
       }
-      if (id === 'radius') {
+      if (id === 'radius') { // 0–50%
         const val = min + Math.random()*(0.50*span);
         inp.value = Math.round(val / step) * step;
         continue;
       }
-      // default full-range
       const raw = min + Math.random()*span;
       const decimals = (step.toString().split('.')[1]||'').length;
       inp.value = raw.toFixed(decimals);
@@ -255,7 +259,7 @@
     const dt = dtRaw * timeScale;
 
     if (playing){
-      /* Trails with curve */
+      // Trails with curve
       const trailRaw = +UI.trail.value;
       const tCurve = +UI.trailCurve.value;
       const tExp = 1.2 + tCurve*3.0;
@@ -263,13 +267,13 @@
       if (trailA <= 0.0001) ctx.clearRect(0,0,W,H);
       else { ctx.fillStyle = `rgba(0,0,0,${trailA})`; ctx.fillRect(0,0,W,H); }
 
-      /* Feedback echo (screen blend) */
+      // Feedback echo (screen blend)
       const fbMix = +UI.feedback.value;
       const fbC   = +UI.fbCurve.value;
       const fbWarp = +UI.fbWarp.value;
       const k = 1.5 + fbC*3.5;
       let fbAlpha = 1 - Math.exp(-k * fbMix);
-      const atten = 0.25 + 0.75 * (trailA); // simpler attenuation; trailA already curved
+      const atten = 0.25 + 0.75 * (trailA);
       fbAlpha = clamp(fbAlpha * atten * 0.9, 0, 0.95);
       if (fbAlpha > 0.001){
         ctx.save();
@@ -285,7 +289,7 @@
         ctx.globalCompositeOperation = 'source-over';
       }
 
-      /* Update Fibonacci phases */
+      // Update Fibonacci phases
       const fiboSpeed = +UI.fiboSpeed.value;
       huePhase += fiboSpeed * dt * 360;
       if (huePhase > 36000) huePhase -= 36000;
@@ -293,23 +297,22 @@
       const EDGE_STEP_DEG = 24;
       const edgePhaseQ = Math.floor(edgePhase / EDGE_STEP_DEG) * EDGE_STEP_DEG;
 
-      /* Sacred field parameters */
+      // Sacred field params
       const psyON = UI.psyOn.checked;
-      const psyInf = +UI.psyInf.value;     // influence strength
-      const psySym = +UI.psySym.value;     // symmetry wedges
-      const psyFreq = +UI.psyFreq.value;   // base frequency
-      const psyLayers = +UI.psyLayers.value|0; // iterations
-      const psyFlow = +UI.psyFlow.value;   // time flow speed
+      const psyInf = +UI.psyInf.value;
+      const psySym = +UI.psySym.value;
+      const psyFreq = +UI.psyFreq.value;
+      const psyLayers = +UI.psyLayers.value|0;
+      const psyFlow = +UI.psyFlow.value;
+      const tField = now*0.001 * psyFlow;
 
-      const tField = now*0.001 * psyFlow;  // independent phase
-
-      /* Sim params */
+      // Sim params
       const jitter = +UI.glitch.value;
       const teleP  = +UI.tele.value;
       const linkR  = +UI.radius.value;
       const thick  = +UI.thick.value;
 
-      /* Nodes: add gentle field force */
+      // Nodes
       for (const n of nodes){
         if (Math.random() < (0.8*jitter) * dt) {
           n.vx += rndN(80*jitter) * dt;
@@ -319,10 +322,8 @@
 
         if (psyON && psyInf>0){
           const F = fieldForce(n.x, n.y, tField, psySym, psyFreq, psyLayers);
-          // push along combined gradient+swirl; scale with influence
           n.vx += F.fx * psyInf * dt * 60;
           n.vy += F.fy * psyInf * dt * 60;
-          // slight breathing of node radius by local field value
           n.r = 2.0 + 1.2 * Math.abs(Math.sin(F.fval*0.8));
         }
 
@@ -341,12 +342,11 @@
         ctx.fill();
       }
 
-      /* Edges — still colored (per-connection Fibonacci, jumpy) */
+      // Edges (colored)
       const N = nodes.length;
       ctx.lineCap = 'round';
       for (let pass=0; pass<2; pass++){
         ctx.lineWidth = (thick * (pass?1:0.5));
-
         let edgeIdx = 0;
         for (let i=0;i<N;i++){
           const a = nodes[i];
@@ -357,28 +357,20 @@
             const reach = linkR * (pass?1.0:0.6);
             if (d < reach){
               const fade = 1 - d / reach;
-
-              // Per-connection Fibonacci hue with jump steps
               const ehue = (edgeBase + edgeIdx * GOLDEN_ANGLE + edgePhaseQ) % 360;
-
-              // Alpha shaped to avoid white blowouts, preserve color
               const baseAlpha = pass ? 0.12 : 0.06;
               const alphaScale = pass ? 0.35 : 0.25;
               const aEdge = clamp(baseAlpha + alphaScale * fade, 0, 0.55);
-
-              // Mid-segment warp
-              // Optionally, tint strength by local field to echo the sacred pattern in edges:
               let mx = (a.x+b.x)/2, my=(a.y+b.y)/2;
-              if (psyON && psyInf>0){
+              if (UI.psyOn.checked && +UI.psyInf.value>0){
                 const Fm = fieldValue(mx,my,tField,psySym,psyFreq,psyLayers);
                 const w = Math.sin(Fm*1.5+now*0.001)*8;
-                mx += rndN(6 + 22*fade) + w;
-                my += rndN(6 + 22*fade) - w;
+                mx += (Math.random()*2-1)*(6 + 22*fade) + w;
+                my += (Math.random()*2-1)*(6 + 22*fade) - w;
               } else {
-                mx += rndN(6 + 22*fade);
-                my += rndN(6 + 22*fade);
+                mx += (Math.random()*2-1)*(6 + 22*fade);
+                my += (Math.random()*2-1)*(6 + 22*fade);
               }
-
               ctx.strokeStyle = `hsla(${ehue}, 95%, 55%, ${aEdge})`;
               ctx.beginPath();
               ctx.moveTo(a.x, a.y);
@@ -390,17 +382,14 @@
         }
       }
 
-      /* Snapshot for feedback */
+      // Snapshot for feedback
       fbc.clearRect(0,0,W,H);
       fbc.drawImage(cv, 0, 0, W, H);
     }
 
     // FPS
     fpsAcc += 1/Math.max(dtRaw, 1e-6); fpsFrames++; fpsT += dtRaw;
-    if (fpsT > 0.5) {
-      fpsEl.textContent = `${(fpsAcc/fpsFrames).toFixed(0)} fps`;
-      fpsAcc=0; fpsFrames=0; fpsT=0;
-    }
+    if (fpsT > 0.5) { fpsEl.textContent = `${(fpsAcc/fpsFrames).toFixed(0)} fps`; fpsAcc=0; fpsFrames=0; fpsT=0; }
 
     requestAnimationFrame(draw);
   }
