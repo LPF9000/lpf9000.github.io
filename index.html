@@ -15,7 +15,7 @@
     display:flex; gap:10px; flex-wrap:wrap; align-items:center;
     background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.2);
     border-radius:12px; padding:10px 12px; font:14px system-ui, sans-serif; color:#fff;
-    max-width:min(950px, calc(100vw - 20px)); z-index:10;
+    max-width:min(1100px, calc(100vw - 20px)); z-index:10;
   }
   .g { display:flex; flex-direction:column; gap:2px; }
   .g label { font-size:12px; opacity:.85 }
@@ -44,11 +44,14 @@
   <div class="g"><label>Nodes</label><input id="nodes" type="range" min="40" max="500" step="10" value="160"></div>
   <div class="g"><label>Link Radius</label><input id="radius" type="range" min="40" max="500" step="5" value="180"></div>
   <div class="g"><label>Trail (persistence)</label><input id="trail" type="range" min="0" max="0.95" step="0.01" value="0.25"></div>
+  <div class="g"><label>Trail Curve</label><input id="trailCurve" type="range" min="0" max="1" step="0.01" value="0.7"></div>
+  <div class="g"><label>Feedback (mix)</label><input id="feedback" type="range" min="0" max="1" step="0.01" value="0.18"></div>
+  <div class="g"><label>Feedback Curve</label><input id="fbCurve" type="range" min="0" max="1" step="0.01" value="0.6"></div>
+  <div class="g"><label>Feedback Warp</label><input id="fbWarp" type="range" min="0" max="1" step="0.01" value="0.35"></div>
   <div class="g"><label>Glitch (jitter)</label><input id="glitch" type="range" min="0" max="1.5" step="0.01" value="0.65"></div>
   <div class="g"><label>Teleport</label><input id="tele" type="range" min="0" max="0.05" step="0.001" value="0.006"></div>
   <div class="g"><label>Edge Thicc</label><input id="thick" type="range" min="0.4" max="4" step="0.1" value="1.2"></div>
   <div class="g"><label>Warp (time)</label><input id="warp" type="range" min="0.1" max="3" step="0.01" value="1.0"></div>
-  <div class="g"><label>Feedback (echo)</label><input id="feedback" type="range" min="0" max="1" step="0.01" value="0.12"></div>
   <button id="random"  type="button">🎲 Randomize</button>
   <button id="pause"   type="button">⏸ Pause</button>
   <span id="fps"></span>
@@ -66,7 +69,7 @@
 
   // Canvas + feedback buffer
   const cv = $('#c');
-  const ctx = cv.getContext('2d'); // keep options default for max compatibility
+  const ctx = cv.getContext('2d');
   const fb = document.createElement('canvas');
   const fbc = fb.getContext('2d');
 
@@ -91,11 +94,14 @@
     nodes: $('#nodes'),
     radius: $('#radius'),
     trail: $('#trail'),
+    trailCurve: $('#trailCurve'),
+    feedback: $('#feedback'),
+    fbCurve: $('#fbCurve'),
+    fbWarp: $('#fbWarp'),
     glitch: $('#glitch'),
     tele:  $('#tele'),
     thick: $('#thick'),
     warp:  $('#warp'),
-    feedback: $('#feedback'),
   };
 
   // State
@@ -104,13 +110,15 @@
   let last = performance.now();
   let timeScale = +UI.warp.value;
 
-  // FPS hud (define BEFORE draw uses it)
-  const fpsEl = $('#fps');
-  let fpsAcc=0, fpsFrames=0, fpsT=0;
+  // FPS
+  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
 
-  // Utilities
+  // Utils
   const rnd  = (a=1)=> Math.random()*a;
   const rndN = (n=1)=> (Math.random()*2-1)*n;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  // Smoothstep for gentle attenuation
+  const smooth = (e0,e1,x)=>{ const t=clamp((x-e0)/(e1-e0),0,1); return t*t*(3-2*t); };
 
   function makeNodes(N){
     nodes = Array.from({length:N}, () => ({
@@ -122,9 +130,14 @@
   }
   makeNodes(+UI.nodes.value);
 
+  function applyFromSliders(){
+    const desired = +UI.nodes.value|0;
+    if (desired !== nodes.length) makeNodes(desired);
+    timeScale = +UI.warp.value;
+  }
+
   // Randomize ALL sliders + palette + velocities
   function randomizeAll(){
-    // Randomize slider values within their min/max using their step precision
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const min = parseFloat(inp.min), max = parseFloat(inp.max);
       const step = parseFloat(inp.step || '1');
@@ -132,9 +145,7 @@
       const decimals = (step.toString().split('.')[1]||'').length;
       inp.value = raw.toFixed(decimals);
     }
-    // Apply from sliders
     applyFromSliders();
-    // Refresh hues & velocities for visible change
     for (const n of nodes){
       n.hue = (Math.random()*360)|0;
       const speed = 1.5 + Math.random()*3.0;
@@ -142,12 +153,6 @@
       n.vx = Math.cos(ang)*speed;
       n.vy = Math.sin(ang)*speed;
     }
-  }
-
-  function applyFromSliders(){
-    const desired = +UI.nodes.value|0;
-    if (desired !== nodes.length) makeNodes(desired);
-    timeScale = +UI.warp.value;
   }
 
   // Bind UI
@@ -158,26 +163,42 @@
   UI.nodes.addEventListener('input', applyFromSliders);
   UI.warp.addEventListener('input', applyFromSliders);
 
-  // Draw loop
   function draw(now){
     const dtRaw = Math.max(0, (now - last) / 1000); last = now;
     const dt = dtRaw * timeScale;
 
     if (playing){
-      // Trails first (so feedback & new strokes sit on top)
-      const trail = +UI.trail.value;
-      if (trail <= 0) ctx.clearRect(0,0,W,H);
-      else { ctx.fillStyle = `rgba(0,0,0,${trail})`; ctx.fillRect(0,0,W,H); }
+      // --- 1) Trail (persistence) with curve mapping ---
+      // trailRaw 0..0.95 → map nonlinearly so low end has finer control
+      const trailRaw = +UI.trail.value;
+      const tCurve = +UI.trailCurve.value;     // 0..1
+      // Exponent grows with curve → finer control near 0
+      const tExp = 1.2 + tCurve*3.0;           // ~1.2 .. 4.2
+      const trailA = Math.pow(trailRaw, tExp); // remapped alpha
+      if (trailA <= 0.0001) ctx.clearRect(0,0,W,H);
+      else { ctx.fillStyle = `rgba(0,0,0,${trailA})`; ctx.fillRect(0,0,W,H); }
 
-      // Visual feedback echo (previous frame), VERY subtle
-      const fbAmt = +UI.feedback.value; // 0..1
-      if (fbAmt > 0){
+      // --- 2) Feedback echo with curve + trail-aware attenuation ---
+      const fbMix = +UI.feedback.value;        // 0..1 (user mix)
+      const fbC   = +UI.fbCurve.value;         // 0..1 (response shaping)
+      const fbWarp = +UI.fbWarp.value;         // 0..1 (transform strength)
+
+      // Saturating curve: alpha = 1 - exp(-k*x), where k grows with fbCurve.
+      const k = 1.5 + fbC*3.5;                 // ~1.5 .. 5.0
+      let fbAlpha = 1 - Math.exp(-k * fbMix);  // 0..~1, smooth near top
+      // Auto-attenuate when trail is low (to prevent blowout):
+      // As trailA→0, atten→0.25; as trailA→1, atten→1.0
+      const atten = 0.25 + 0.75 * smooth(0.0, 1.0, trailA);
+      fbAlpha = clamp(fbAlpha * atten * 0.9, 0, 0.95); // cap a bit below 1
+
+      if (fbAlpha > 0.001){
         ctx.save();
-        ctx.globalAlpha = Math.min(0.9, fbAmt * 0.6);
-        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = fbAlpha;
+        // gentler than 'lighter'; reduces additive blowouts
+        ctx.globalCompositeOperation = 'screen';
         ctx.translate(W/2, H/2);
-        const s = 1 + fbAmt * 0.004;
-        const r = fbAmt * 0.0015;
+        const s = 1 + fbWarp * 0.006;          // tiny scale
+        const r = fbWarp * 0.002;              // tiny rotation (radians-ish)
         ctx.scale(s, s);
         ctx.rotate(r);
         ctx.translate(-W/2, -H/2);
@@ -186,13 +207,13 @@
         ctx.globalCompositeOperation = 'source-over';
       }
 
-      // Params
+      // --- 3) Simulation params ---
       const jitter = +UI.glitch.value;
       const teleP  = +UI.tele.value;
       const linkR  = +UI.radius.value;
       const thick  = +UI.thick.value;
 
-      // Update & draw nodes
+      // --- 4) Nodes update/draw ---
       for (const n of nodes){
         if (Math.random() < (0.8*jitter) * dt) {
           n.vx += rndN(80*jitter) * dt;
@@ -214,7 +235,7 @@
         ctx.fill();
       }
 
-      // Edges / scaffolding (two-pass for depth)
+      // --- 5) Edges / scaffolding (two-pass) ---
       const N = nodes.length;
       ctx.lineCap = 'round';
       for (let pass=0; pass<2; pass++){
@@ -241,12 +262,12 @@
         }
       }
 
-      // Update feedback buffer (snapshot current frame)
+      // --- 6) Update feedback buffer (snapshot current frame) ---
       fbc.clearRect(0,0,W,H);
       fbc.drawImage(cv, 0, 0, W, H);
     }
 
-    // FPS (smoothed)
+    // FPS
     fpsAcc += 1/Math.max(dtRaw, 1e-6); fpsFrames++; fpsT += dtRaw;
     if (fpsT > 0.5) {
       fpsEl.textContent = `${(fpsAcc/fpsFrames).toFixed(0)} fps`;
@@ -256,11 +277,19 @@
     requestAnimationFrame(draw);
   }
 
-  // Kick off
   requestAnimationFrame(draw);
 
   // Nice starting shuffle
-  setTimeout(()=> randomizeAll(), 250);
+  setTimeout(() => {
+    // small nudge: randomize colors/vels but keep current slider values
+    for (const n of nodes){
+      n.hue = (Math.random()*360)|0;
+      const speed = 1.5 + Math.random()*3.0;
+      const ang = Math.random()*Math.PI*2;
+      n.vx = Math.cos(ang)*speed;
+      n.vy = Math.sin(ang)*speed;
+    }
+  }, 250);
 })();
 </script>
 </body>
