@@ -3,21 +3,23 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>glitch-network</title>
+<title>glitch-network (iOS-safe)</title>
 <style>
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
   canvas { display:block; width:100vw; height:100vh; touch-action:none; }
   #ui {
     position:fixed; top:12px; left:50%; transform:translateX(-50%);
-    background:rgba(0,0,0,.4); padding:10px 16px; border-radius:12px;
-    font-family:sans-serif; font-size:16px; color:#fff;
+    background:rgba(0,0,0,.45); padding:10px 16px; border-radius:12px;
+    font-family:system-ui, sans-serif; font-size:16px; color:#fff;
     border:1px solid rgba(255,255,255,.25); display:flex; gap:10px; align-items:center;
   }
   button {
     appearance:none; background:#111; border:1px solid #59f; border-radius:8px;
     color:#59f; padding:10px 20px; font-size:16px; cursor:pointer;
   }
-  #status { font-size:12px; color:#9af; opacity:.9 }
+  #status { font-size:12px; color:#9af; opacity:.95 }
+  /* Show native controls only if needed */
+  #player { position:fixed; left:12px; bottom:12px; width:calc(100% - 24px); display:none; }
   #drop { position:fixed; inset:0; display:none; place-items:center;
     color:#9af; background:rgba(0,0,20,.7); border:2px dashed #59f;
     font-family:sans-serif; font-size:18px; }
@@ -25,80 +27,84 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+
 <div id="ui">
-  <button id="fileBtn">🎵 Load Audio</button>
+  <button id="fileBtn">🎵 Load / Play</button>
   <span id="status"></span>
 </div>
+
+<!-- Hidden audio element (made visible only if iOS insists on manual Play) -->
+<audio id="player" controls></audio>
+
 <div id="drop">Drop an audio file…</div>
 
 <script>
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
+const player = document.getElementById("player");
 
 let W,H,DPR=Math.max(1,Math.min(window.devicePixelRatio||1,2));
 function resize(){ W=canvas.width=innerWidth*DPR; H=canvas.height=innerHeight*DPR; }
 addEventListener("resize",resize,{passive:true}); resize();
 
-// ---- Audio (mobile-safe) ----
-let actx, analyser, dataArray, gain, currentSrc=null, started=false;
-
 function setStatus(msg){ statusEl.textContent = msg || ""; }
 
-function ensureAudio(){
+// ---- iOS-safe audio: use <audio> element + MediaElementSource ----
+let actx, analyser, dataArray, srcNode, urlRef=null, started=false;
+
+function ensureAudioContext(){
   if (actx) return;
   const AC = window.AudioContext || window.webkitAudioContext;
   actx = new AC({ latencyHint: "interactive" });
   analyser = actx.createAnalyser();
   analyser.fftSize = 512;
   dataArray = new Uint8Array(analyser.frequencyBinCount);
-  gain = actx.createGain();
-  gain.gain.value = 1.0;
-  gain.connect(actx.destination);
 }
 
-async function startFromFile(file){
-  ensureAudio();
-  // iOS/Android need resume() inside gesture path (we're in a click handler)
-  try { await actx.resume(); } catch(e){ setStatus("Resume failed: "+e.message); }
+async function loadAndPlayFile(file){
+  // Revoke previous object URL if any
+  if (urlRef) { URL.revokeObjectURL(urlRef); urlRef = null; }
+  // Point the <audio> element to the chosen file
+  urlRef = URL.createObjectURL(file);
+  player.src = urlRef;
+  player.loop = true;
 
-  // stop previous source if any
-  if (currentSrc) {
-    try { currentSrc.stop(); } catch(_) {}
-    try { currentSrc.disconnect(); } catch(_) {}
-    currentSrc = null;
+  ensureAudioContext();
+  // Create the MediaElementSource ONCE per audio element
+  if (!srcNode) {
+    srcNode = actx.createMediaElementSource(player);
+    // Route ONLY to analyser; the <audio> element handles actual playback
+    // (avoid double audio by not connecting to destination here)
+    srcNode.connect(analyser);
   }
+
+  // Try to resume the context and play within the same gesture
+  try { await actx.resume(); } catch(e) { /* ignore */ }
 
   try {
-    const buf = await file.arrayBuffer();
-    const audio = await actx.decodeAudioData(buf);
-    const src = actx.createBufferSource();
-    src.buffer = audio;
-    src.loop = true;
-
-    // Tee to analyser (visuals) and to speakers (via gain)
-    src.connect(analyser);
-    src.connect(gain);
-
-    src.start(0);
-    currentSrc = src;
+    await player.play();   // iOS-friendly: real element playback
     started = true;
-    setStatus(""); // clear any “tap to enable” hints
+    setStatus("");
+    // Hide controls when autoplay succeeded
+    player.style.display = "none";
   } catch (e) {
-    setStatus("Audio load error: " + (e && e.message || e));
+    // If iOS blocks autoplay, show native controls so user can tap Play
+    player.style.display = "block";
+    setStatus("Tap Play on the player to start audio.");
   }
 }
 
-// File picker button (mobile-friendly)
+// File picker button (mobile-first)
 document.getElementById("fileBtn").onclick = () => {
   const inp = document.createElement("input");
   inp.type = "file";
   inp.accept = ".mp3,.wav,.ogg,.flac,.aac,.m4a";
-  inp.onchange = (e) => { if (inp.files && inp.files[0]) startFromFile(inp.files[0]); };
+  inp.onchange = () => { if (inp.files && inp.files[0]) loadAndPlayFile(inp.files[0]); };
   inp.click();
 };
 
-// Optional desktop drag & drop (ignored on mobile)
+// Optional: desktop drag & drop
 const drop = document.getElementById("drop"); let dragCount=0;
 addEventListener("dragenter",e=>{e.preventDefault();dragCount++;drop.style.display="grid";});
 addEventListener("dragleave",e=>{e.preventDefault();dragCount=Math.max(0,dragCount-1);if(!dragCount)drop.style.display="none";});
@@ -106,10 +112,16 @@ addEventListener("dragover",e=>e.preventDefault());
 addEventListener("drop",e=>{
   e.preventDefault();dragCount=0;drop.style.display="none";
   const f=e.dataTransfer.files && e.dataTransfer.files[0];
-  if (f) startFromFile(f);
+  if (f) loadAndPlayFile(f);
 });
 
-// ---- Particles (glitchy architectural network) ----
+// If user manually presses Play on the native controls, ensure context is running
+player.addEventListener("play", async () => {
+  try { await actx.resume(); } catch(_) {}
+  started = true; setStatus("");
+});
+
+// ---- Visuals: glitchy architectural network ----
 const N=140, nodes=[];
 for(let i=0;i<N;i++){
   nodes.push({
@@ -119,59 +131,50 @@ for(let i=0;i<N;i++){
   });
 }
 
-function audioEnergy(){
+function energy(){
   if(!started || !analyser) return 0;
   analyser.getByteFrequencyData(dataArray);
-  let sum=0; for (let v of dataArray) sum+=v;
-  return sum/(dataArray.length*255); // 0..1
+  let s=0; for (let v of dataArray) s+=v;
+  return s/(dataArray.length*255); // 0..1
 }
 
 function draw(){
-  // subtle trails
   ctx.fillStyle = "rgba(0,0,0,0.25)";
   ctx.fillRect(0,0,W,H);
 
-  if (actx && actx.state !== "running") setStatus("Tap ‘Load Audio’ and select a file");
+  const e = energy();
+  if (!started) setStatus("Tap ‘Load / Play’ and choose a file");
 
-  const energy = audioEnergy();
-
-  // “glitch” bursts: random kicks + occasional teleports
-  for(let n of nodes){
-    if (Math.random() < 0.02 + energy*0.06) {
-      n.vx += (Math.random()-0.5)*10*energy;
-      n.vy += (Math.random()-0.5)*10*energy;
-      if (Math.random() < 0.003 + energy*0.01) { // rare teleport
-        n.x = Math.random()*W; n.y = Math.random()*H;
-      }
+  // Glitch bursts + occasional teleports
+  for (let n of nodes){
+    if (Math.random() < 0.02 + e*0.06) {
+      n.vx += (Math.random()-0.5)*10*e;
+      n.vy += (Math.random()-0.5)*10*e;
+      if (Math.random() < 0.003 + e*0.01) { n.x = Math.random()*W; n.y = Math.random()*H; }
     }
-
     n.x += n.vx; n.y += n.vy;
-    if (n.x<0||n.x>W) n.vx*=-1;
-    if (n.y<0||n.y>H) n.vy*=-1;
+    if (n.x<0||n.x>W) n.vx *= -1;
+    if (n.y<0||n.y>H) n.vy *= -1;
 
-    // nodes
     ctx.beginPath();
     ctx.arc(n.x,n.y,n.r,0,Math.PI*2);
-    ctx.fillStyle = `hsl(${180+energy*200},80%,${45+energy*40}%)`;
+    ctx.fillStyle = `hsl(${180+e*200},80%,${45+e*40}%)`;
     ctx.fill();
   }
 
-  // edges (architectural scaffolding)
-  ctx.lineWidth = 0.8 + energy*2.2;
-  for(let i=0;i<N;i++){
-    for(let j=i+1;j<N;j++){
-      const dx = nodes[i].x - nodes[j].x;
-      const dy = nodes[i].y - nodes[j].y;
-      const d  = Math.hypot(dx,dy);
-      const reach = 110 + energy*220; // connect radius grows with energy
+  // Edges / scaffolding
+  ctx.lineWidth = 0.8 + e*2.2;
+  for (let i=0;i<N;i++){
+    for (let j=i+1;j<N;j++){
+      const dx=nodes[i].x-nodes[j].x, dy=nodes[i].y-nodes[j].y, d=Math.hypot(dx,dy);
+      const reach = 110 + e*220;
       if (d < reach){
         const a = 1 - d/(reach+1);
         ctx.strokeStyle = `rgba(180,210,255,${0.08 + a*0.5})`;
         ctx.beginPath();
         ctx.moveTo(nodes[i].x, nodes[i].y);
-        // slight mid-segment jitter to feel “glitchy”
-        const mx = (nodes[i].x + nodes[j].x)/2 + (Math.random()-0.5)*6*energy;
-        const my = (nodes[i].y + nodes[j].y)/2 + (Math.random()-0.5)*6*energy;
+        const mx = (nodes[i].x + nodes[j].x)/2 + (Math.random()-0.5)*6*e;
+        const my = (nodes[i].y + nodes[j].y)/2 + (Math.random()-0.5)*6*e;
         ctx.lineTo(mx, my);
         ctx.lineTo(nodes[j].x, nodes[j].y);
         ctx.stroke();
