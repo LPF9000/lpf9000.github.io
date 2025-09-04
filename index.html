@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>glitch-network (mobile-safe)</title>
+<title>glitch-network (iOS load fix)</title>
 <style>
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
   canvas { display:block; width:100vw; height:100vh; touch-action:none; }
@@ -18,9 +18,8 @@
     color:#59f; padding:10px 16px; font-size:16px; cursor:pointer;
   }
   input[type="range"]{ width:120px; }
-  #status { font-size:12px; color:#9af; opacity:.95 }
-  /* Native controls are hidden unless we really need them */
-  #player { position:fixed; left:12px; bottom:12px; width:calc(100% - 24px); display:none; }
+  #status { font-size:12px; color:#9af; opacity:.95; min-width:200px }
+  #player { display:none } /* we control playback via buttons; will show if needed */
 </style>
 </head>
 <body>
@@ -36,8 +35,7 @@
   <span id="status"></span>
 </div>
 
-<!-- Hidden audio element (decoded by Safari). We route it via WebAudio. -->
-<audio id="player" playsinline preload="auto"></audio>
+<audio id="player" playsinline preload="metadata"></audio>
 
 <script>
 const canvas = document.getElementById("c");
@@ -54,8 +52,14 @@ function resize(){ W=canvas.width=innerWidth*DPR; H=canvas.height=innerHeight*DP
 addEventListener("resize",resize,{passive:true}); resize();
 
 function setStatus(msg){ statusEl.textContent = msg || ""; }
+function stat() {
+  const rsMap = ["HAVE_NOTHING","HAVE_METADATA","HAVE_CURRENT_DATA","HAVE_FUTURE_DATA","HAVE_ENOUGH_DATA"];
+  const rs = player.readyState!=null ? rsMap[player.readyState] || player.readyState : "?";
+  const d = isFinite(player.duration) ? player.duration.toFixed(2) : "—";
+  setStatus(`state:${rs} dur:${d}s`);
+}
 
-// ---- Audio: <audio> + WebAudio routing ----
+// ---- Audio graph ----
 let actx, analyser, dataArray, srcNode, gainNode, urlRef=null, started=false;
 
 function ensureAudio(){
@@ -71,91 +75,103 @@ function ensureAudio(){
   gainNode.gain.value = +vol.value;
   gainNode.connect(actx.destination);
   vol.oninput = () => { if (gainNode) gainNode.gain.value = +vol.value; };
+
+  // Create MediaElementSource ONCE (lifetime of the element)
+  srcNode = actx.createMediaElementSource(player);
+  srcNode.connect(analyser);
+  srcNode.connect(gainNode);
+
+  // Mute element’s own output to avoid double audio; WebAudio path handles sound
+  player.muted = true;
 }
 
-async function resumeCtx(){ if (actx && actx.state !== "running") { try { await actx.resume(); } catch(_) {} } }
-
-function bindGraphOnce(){
-  if (srcNode) return;
-  // One MediaElementSource per <audio> for lifetime
-  srcNode = actx.createMediaElementSource(player);
-  srcNode.connect(analyser);     // visuals
-  srcNode.connect(gainNode);     // speakers
-  // IMPORTANT: mute element's own output to avoid double audio; WebAudio handles playback
-  player.muted = true;
+async function resumeCtx(){
+  if (actx && actx.state !== "running") { try { await actx.resume(); } catch(_) {} }
 }
 
 function revokeOldURL(){ if (urlRef) { URL.revokeObjectURL(urlRef); urlRef = null; } }
 
-async function loadFileViaPicker(){
+// Load via picker
+loadBtn.onclick = async () => {
   ensureAudio();
   await resumeCtx();
 
   const inp = document.createElement("input");
   inp.type = "file";
-  // If you truly want "any file", leave accept empty; we’ll error if unsupported.
-  // inp.accept = "";
-  // If you want to hint, uncomment:
+  // Leave accept empty to allow any; iOS will refuse unsupported codecs.
   // inp.accept = ".mp3,.m4a,.aac,.wav,.alac,.aif,.aiff,.caf,.flac,.ogg";
   inp.onchange = async () => {
     if (!(inp.files && inp.files[0])) return;
     const file = inp.files[0];
-    revokeOldURL();
-    ensureAudio();
-    bindGraphOnce();
 
-    // Point <audio> at blob URL
+    // Reset element to a clean state
+    player.removeAttribute("src");
+    player.load();
+
+    revokeOldURL();
     urlRef = URL.createObjectURL(file);
     player.src = urlRef;
     player.loop = true;
-    setStatus("Loading…");
 
-    try { await player.play(); started = true; setStatus(""); }
-    catch(e){
-      // If autoplay disallowed, show native controls so user can press Play
-      player.controls = true;
-      player.style.display = "block";
-      setStatus("Tap Play on the control bar to start.");
-    }
+    setStatus("Loading metadata…");
+    // Force a load cycle so iOS fetches metadata
+    player.load();
+
+    // Wait for metadata (duration becomes known); then try canplay
+    await new Promise((res, rej) => {
+      const onMeta = () => { stat(); cleanup(); res(); };
+      const onErr = () => { setStatus("Error loading file (unsupported?)"); cleanup(); res(); };
+      const cleanup = () => {
+        player.removeEventListener("loadedmetadata", onMeta);
+        player.removeEventListener("error", onErr);
+      };
+      player.addEventListener("loadedmetadata", onMeta, { once:true });
+      player.addEventListener("error", onErr, { once:true });
+    });
+
+    // Optional: wait for canplay to be extra safe
+    await new Promise((res) => {
+      if (player.readyState >= 3) return res();
+      const onCP = () => { res(); player.removeEventListener("canplay", onCP); };
+      player.addEventListener("canplay", onCP);
+      // Also resolve after short timeout to avoid hanging
+      setTimeout(res, 250);
+    });
+
+    stat();
   };
   inp.click();
-}
+};
 
-async function play(){
+// Play/Pause
+playBtn.onclick = async () => {
   ensureAudio();
-  bindGraphOnce();
   await resumeCtx();
-  try { await player.play(); started = true; setStatus(""); }
+  try { await player.play(); started = true; stat(); }
   catch(e){
+    // As fallback, expose native controls; one tap on Play always works
     player.controls = true;
     player.style.display = "block";
     setStatus("Tap Play on the control bar to start.");
   }
-}
-function pause(){ try { player.pause(); } catch(_){} }
+};
+pauseBtn.onclick = () => { try { player.pause(); stat(); } catch(_){} };
 
-// Handle media errors (unsupported codec, bad file, etc.)
+// Media events to keep you informed
+player.addEventListener("loadedmetadata", stat);
+player.addEventListener("canplay", stat);
+player.addEventListener("timeupdate", stat);
 player.addEventListener("error", () => {
   const err = player.error;
   let msg = "Playback error.";
-  if (err){
-    // MediaError codes: 1 ABORTED, 2 NETWORK, 3 DECODE, 4 SRC_NOT_SUPPORTED
+  if (err) {
     const map = {1:"aborted",2:"network",3:"decode",4:"src not supported"};
     msg = `Playback error (${map[err.code]||err.code}).`;
   }
   setStatus(msg + " Try MP3, M4A/AAC, WAV, or ALAC on iPhone.");
-  // Expose native controls so user can try again or scrub
   player.controls = true;
   player.style.display = "block";
 });
-
-// Ensure graph is live if user taps Play on native controls
-player.addEventListener("play", async () => { await resumeCtx(); started = true; setStatus(""); });
-
-// UI buttons
-loadBtn.onclick = loadFileViaPicker;
-playBtn.onclick = play;
-pauseBtn.onclick = pause;
 
 // ---- Visuals: glitchy architectural network ----
 const N=160, nodes=[];
@@ -177,9 +193,7 @@ function draw(){
   ctx.fillRect(0,0,W,H);
 
   const e = energy();
-  if (!started) setStatus("Tap Load, choose a file, then Play.");
-
-  // More chaotic “architecture” feel
+  // Architecture + glitches
   for (let n of nodes){
     if (Math.random() < 0.025 + e*0.08) {
       n.vx += (Math.random()-0.5)*12*e;
@@ -196,7 +210,6 @@ function draw(){
     ctx.fill();
   }
 
-  // Edges / scaffolding with mid-segment jitter
   const reach = 120 + e*240;
   ctx.lineWidth = 0.8 + e*2.4;
   for (let i=0;i<N;i++){
