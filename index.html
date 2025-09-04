@@ -43,7 +43,6 @@
 
 <script>
 (() => {
-  // --- tiny helpers ---
   const $ = sel => document.querySelector(sel);
   const canvas = $('#c');
   const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
@@ -52,7 +51,6 @@
   const resize = () => { W = canvas.width = Math.floor(innerWidth * DPR); H = canvas.height = Math.floor(innerHeight * DPR); };
   addEventListener('resize', resize, { passive:true }); resize();
 
-  // --- audio ---
   let actx, analyser, srcNode, dataArray, playing = true, started = false, audioBufferSource = null;
   const FFT_SIZE = 2048;
 
@@ -92,11 +90,11 @@
     if (srcNode) { try { srcNode.disconnect(); } catch(_){} srcNode = null; }
   }
 
-  // --- UI wiring ---
   $('#mic').onclick = () => useMic().catch(console.error);
   $('#file').onclick = () => {
     const inp = document.createElement('input');
-    inp.type = 'file'; inp.accept = 'audio/*';
+    inp.type = 'file';
+    inp.accept = '.mp3,.wav,.ogg,.flac,.aac,.m4a';  // <-- stricter audio-only filter
     inp.onchange = e => { if (inp.files && inp.files[0]) useFile(inp.files[0]); };
     inp.click();
   };
@@ -107,7 +105,6 @@
     if (e.key === ' ') { e.preventDefault(); $('#pause').click(); }
   });
 
-  // drag & drop
   let dragCount = 0;
   addEventListener('dragenter', (e) => { e.preventDefault(); dragCount++; drop.style.display='grid'; });
   addEventListener('dragleave', (e) => { e.preventDefault(); dragCount=Math.max(0, dragCount-1); if(!dragCount) drop.style.display='none'; });
@@ -118,12 +115,6 @@
     if (f) useFile(f);
   });
 
-  // --- visuals ---
-  // A lightweight “glitch” pipeline:
-  // 1) base gradient flow
-  // 2) chromatic offset (RGB channels shifted by audio energy)
-  // 3) horizontal slice displacements (audio-gated)
-  // 4) scanlines overlay
   const params = {
     glitch: $('#glitch'),
     intensity: $('#intensity'),
@@ -135,7 +126,6 @@
   function draw(now) {
     const dt = (now - t0) / 1000; t0 = now;
     if (playing) {
-      // Base animated gradient
       const time = now * 0.00025;
       const g = ctx.createLinearGradient(0, 0, W, H);
       g.addColorStop(0,   `hsl(${(time*120)%360} 80% 50%)`);
@@ -144,37 +134,28 @@
       ctx.fillStyle = g;
       ctx.fillRect(0,0,W,H);
 
-      // If audio started, fetch spectrum
       let energy = 0, bass = 0;
       if (started && analyser) {
         analyser.getByteFrequencyData(dataArray);
-        // overall energy
         for (let i=0;i<dataArray.length;i++) energy += dataArray[i];
         energy /= (dataArray.length*255);
-        // bass emphasis ~ first 1/10th
         const bassBins = Math.max(8, (dataArray.length/10)|0);
         for (let i=0;i<bassBins;i++) bass += dataArray[i];
         bass /= (bassBins*255);
       }
 
-      // Chromatic aberration (RGB offset by small deltas)
-      // Do it cheaply by copying canvas multiple times with globalCompositeOperation
-      const fx = +params.fx.value;               // 0..1
-      const shift = (2 + 10*fx) * (0.2 + energy); // pixels (in device px)
+      const fx = +params.fx.value;
+      const shift = (2 + 10*fx) * (0.2 + energy);
       ctx.globalCompositeOperation = 'lighter';
       ctx.globalAlpha = 0.5;
-      // R
       ctx.drawImage(canvas, shift, 0, W, H, 0, 0, W, H);
-      // G
       ctx.drawImage(canvas, 0, shift, W, H, 0, 0, W, H);
-      // B
       ctx.drawImage(canvas, -shift, 0, W, H, 0, 0, W, H);
       ctx.globalAlpha = 1.0;
       ctx.globalCompositeOperation = 'source-over';
 
-      // Horizontal slice “datamosh” style glitches
-      const gAmt = +params.glitch.value; // 0..1
-      const intensity = +params.intensity.value; // 0..1.25
+      const gAmt = +params.glitch.value;
+      const intensity = +params.intensity.value;
       const slices = Math.floor(2 + 24 * gAmt * (0.3 + energy));
       for (let i=0;i<slices;i++) {
         if (Math.random() > (0.3 + gAmt*0.7) * (0.25 + energy*0.75)) continue;
@@ -184,15 +165,13 @@
         ctx.drawImage(canvas, 0, y, W, h, xShift, y, W, h);
       }
 
-      // Scanlines
-      const scan = +params.scan.value; // 0..1
+      const scan = +params.scan.value;
       if (scan > 0) {
         ctx.globalAlpha = 0.12 * scan;
         for (let y=0; y<H; y+=2) { ctx.fillStyle = '#000'; ctx.fillRect(0,y,W,1); }
         ctx.globalAlpha = 1.0;
       }
 
-      // subtle vignette
       ctx.fillStyle = 'rgba(0,0,0,0.08)';
       ctx.fillRect(0,0,W,10);
       ctx.fillRect(0,H-10,W,10);
@@ -203,7 +182,6 @@
   }
   requestAnimationFrame(draw);
 
-  // Mobile/Autoplay safety: resume audio on first gesture
   const resume = () => { if (actx && actx.state === 'suspended') actx.resume(); removeEventListener('pointerdown', resume); };
   addEventListener('pointerdown', resume, { passive:true });
 })();
