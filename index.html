@@ -6,67 +6,115 @@
 <title>glitch-network</title>
 <style>
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
-  canvas { display:block; width:100vw; height:100vh; }
-  #ui { position:fixed; top:10px; left:10px; color:#fff; font-family:monospace; font-size:14px; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+  #ui {
+    position:fixed; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,.4); padding:10px 16px; border-radius:12px;
+    font-family:sans-serif; font-size:16px; color:#fff; 
+    border:1px solid rgba(255,255,255,.25);
+  }
+  button {
+    appearance:none; background:#111; border:1px solid #59f; border-radius:8px;
+    color:#59f; padding:10px 20px; font-size:16px; cursor:pointer;
+  }
+  #drop { position:fixed; inset:0; display:none; place-items:center;
+    color:#9af; background:rgba(0,0,20,.7); border:2px dashed #59f;
+    font-family:sans-serif; font-size:18px; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="ui">🎵 Drop audio or press space for mic</div>
+<div id="ui"><button id="fileBtn">🎵 Load Audio</button></div>
+<div id="drop">Drop an audio file…</div>
+
 <script>
 const canvas=document.getElementById("c"),ctx=canvas.getContext("2d");
 let W,H,DPR=Math.max(1,Math.min(window.devicePixelRatio||1,2));
 function resize(){W=canvas.width=innerWidth*DPR;H=canvas.height=innerHeight*DPR;}
 addEventListener("resize",resize);resize();
 
-// --- audio setup ---
-let actx,analyser,dataArray,srcNode,started=false;
-async function initAudioMic(){
-  if(!actx){actx=new AudioContext();analyser=actx.createAnalyser();analyser.fftSize=512;dataArray=new Uint8Array(analyser.frequencyBinCount);}
-  const stream=await navigator.mediaDevices.getUserMedia({audio:true});
-  srcNode=actx.createMediaStreamSource(stream);srcNode.connect(analyser);started=true;
-}
+// --- audio ---
+let actx,analyser,dataArray,started=false;
 async function initAudioFile(file){
-  if(!actx){actx=new AudioContext();analyser=actx.createAnalyser();analyser.fftSize=512;dataArray=new Uint8Array(analyser.frequencyBinCount);}
-  const buf=await file.arrayBuffer();const audio=await actx.decodeAudioData(buf);
-  const bs=actx.createBufferSource();bs.buffer=audio;bs.loop=true;bs.connect(analyser);bs.connect(actx.destination);bs.start();started=true;
+  if(!actx){
+    actx=new AudioContext();
+    analyser=actx.createAnalyser();
+    analyser.fftSize=512;
+    dataArray=new Uint8Array(analyser.frequencyBinCount);
+  }
+  const buf=await file.arrayBuffer();
+  const audio=await actx.decodeAudioData(buf);
+  const src=actx.createBufferSource();
+  src.buffer=audio; src.loop=true;
+  src.connect(analyser);
+  src.connect(actx.destination); // hear it
+  src.start(0);
+  started=true;
 }
-addEventListener("keydown",e=>{if(e.code==="Space"){initAudioMic();}});
-addEventListener("drop",e=>{e.preventDefault();if(e.dataTransfer.files[0])initAudioFile(e.dataTransfer.files[0]);});
+
+// file picker button
+document.getElementById("fileBtn").onclick=()=>{
+  const inp=document.createElement("input");
+  inp.type="file";
+  inp.accept=".mp3,.wav,.ogg,.flac,.aac,.m4a";
+  inp.onchange=e=>{ if(inp.files[0]) initAudioFile(inp.files[0]); };
+  inp.click();
+};
+
+// drag & drop (desktop convenience)
+const drop=document.getElementById("drop"); let dragCount=0;
+addEventListener("dragenter",e=>{e.preventDefault();dragCount++;drop.style.display="grid";});
+addEventListener("dragleave",e=>{e.preventDefault();dragCount=Math.max(0,dragCount-1);if(!dragCount)drop.style.display="none";});
 addEventListener("dragover",e=>e.preventDefault());
+addEventListener("drop",e=>{
+  e.preventDefault();dragCount=0;drop.style.display="none";
+  const f=e.dataTransfer.files && e.dataTransfer.files[0];
+  if(f) initAudioFile(f);
+});
 
 // --- particles ---
-const N=120, nodes=[];
-for(let i=0;i<N;i++){nodes.push({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-0.5)*2,vy:(Math.random()-0.5)*2,r:2+Math.random()*3});}
+const N=120,nodes=[];
+for(let i=0;i<N;i++){
+  nodes.push({x:Math.random()*W,y:Math.random()*H,
+              vx:(Math.random()-0.5)*2,vy:(Math.random()-0.5)*2,
+              r:2+Math.random()*3});
+}
 
 function stepAudio(){
   if(!started) return 0;
   analyser.getByteFrequencyData(dataArray);
-  let avg=0;for(let i=0;i<dataArray.length;i++)avg+=dataArray[i];avg/=dataArray.length;
-  return avg/255; // 0..1
+  let avg=0; for(let v of dataArray) avg+=v;
+  return avg/(dataArray.length*255); // 0..1
 }
 
 function draw(){
-  ctx.fillStyle="rgba(0,0,0,0.25)";ctx.fillRect(0,0,W,H);
+  ctx.fillStyle="rgba(0,0,0,0.25)";
+  ctx.fillRect(0,0,W,H);
   let energy=stepAudio();
+
   for(let n of nodes){
-    // jitter / glitch
-    if(Math.random()<0.02+energy*0.05){n.vx+=(Math.random()-0.5)*8*energy;n.vy+=(Math.random()-0.5)*8*energy;}
-    n.x+=n.vx;n.y+=n.vy;
-    if(n.x<0||n.x>W){n.vx*=-1;}
-    if(n.y<0||n.y>H){n.vy*=-1;}
-    // draw node
-    ctx.beginPath();ctx.arc(n.x,n.y,n.r,0,Math.PI*2);
+    if(Math.random()<0.02+energy*0.05){
+      n.vx+=(Math.random()-0.5)*8*energy;
+      n.vy+=(Math.random()-0.5)*8*energy;
+    }
+    n.x+=n.vx; n.y+=n.vy;
+    if(n.x<0||n.x>W) n.vx*=-1;
+    if(n.y<0||n.y>H) n.vy*=-1;
+    ctx.beginPath();
+    ctx.arc(n.x,n.y,n.r,0,Math.PI*2);
     ctx.fillStyle=`hsl(${200+energy*160},80%,${50+energy*40}%)`;
     ctx.fill();
   }
-  // draw edges
-  ctx.lineWidth=1+energy*2;ctx.strokeStyle=`rgba(180,200,255,${0.2+energy*0.5})`;
+  ctx.lineWidth=1+energy*2;
+  ctx.strokeStyle=`rgba(180,200,255,${0.25+energy*0.5})`;
   for(let i=0;i<N;i++){for(let j=i+1;j<N;j++){
     let dx=nodes[i].x-nodes[j].x,dy=nodes[i].y-nodes[j].y,dist=Math.hypot(dx,dy);
     if(dist<120+energy*200){
       ctx.globalAlpha=1-dist/(200+energy*300);
-      ctx.beginPath();ctx.moveTo(nodes[i].x,nodes[i].y);ctx.lineTo(nodes[j].x,nodes[j].y);ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(nodes[i].x,nodes[i].y);
+      ctx.lineTo(nodes[j].x,nodes[j].y);
+      ctx.stroke();
     }
   }}ctx.globalAlpha=1;
   requestAnimationFrame(draw);
