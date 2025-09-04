@@ -2,236 +2,215 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>glitch-network (iOS load fix)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>glitch-mesh</title>
 <style>
-  html,body { margin:0; height:100%; background:#000; overflow:hidden; }
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#000; }
   canvas { display:block; width:100vw; height:100vh; touch-action:none; }
   #ui {
-    position:fixed; top:12px; left:50%; transform:translateX(-50%);
-    background:rgba(0,0,0,.45); padding:10px 16px; border-radius:12px;
-    font-family:system-ui, sans-serif; font-size:16px; color:#fff;
-    border:1px solid rgba(255,255,255,.25); display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+    position:fixed; top:10px; left:50%; transform:translateX(-50%);
+    display:flex; gap:10px; flex-wrap:wrap; align-items:center;
+    background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.2);
+    border-radius:12px; padding:10px 12px; font:14px system-ui, sans-serif; color:#fff;
+    max-width:min(950px, calc(100vw - 20px));
   }
+  .g { display:flex; flex-direction:column; gap:2px; }
+  .g label { font-size:12px; opacity:.85 }
+  .g input[type="range"] { width:140px; }
   button {
-    appearance:none; background:#111; border:1px solid #59f; border-radius:8px;
-    color:#59f; padding:10px 16px; font-size:16px; cursor:pointer;
+    appearance:none; background:#111; color:#7fb0ff; border:1px solid #7fb0ff;
+    padding:9px 14px; border-radius:9px; font:14px system-ui,sans-serif; cursor:pointer;
   }
-  input[type="range"]{ width:120px; }
-  #status { font-size:12px; color:#9af; opacity:.95; min-width:200px }
-  #player { display:none } /* we control playback via buttons; will show if needed */
+  #fps { font-size:12px; color:#9ad; opacity:.85; margin-left:4px }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 
 <div id="ui">
-  <button id="loadBtn">📁 Load</button>
-  <button id="playBtn">▶️ Play</button>
-  <button id="pauseBtn">⏸ Pause</button>
-  <label style="display:flex;align-items:center;gap:6px;">
-    Vol <input id="vol" type="range" min="0" max="1" step="0.01" value="1">
-  </label>
-  <span id="status"></span>
+  <div class="g"><label>Nodes</label><input id="nodes" type="range" min="40" max="400" step="10" value="160"></div>
+  <div class="g"><label>Link Radius</label><input id="radius" type="range" min="40" max="500" step="5" value="180"></div>
+  <div class="g"><label>Trail (persistence)</label><input id="trail" type="range" min="0" max="0.95" step="0.01" value="0.25"></div>
+  <div class="g"><label>Glitch (jitter)</label><input id="glitch" type="range" min="0" max="1.5" step="0.01" value="0.65"></div>
+  <div class="g"><label>Teleport</label><input id="tele" type="range" min="0" max="0.05" step="0.001" value="0.006"></div>
+  <div class="g"><label>Edge Thicc</label><input id="thick" type="range" min="0.4" max="4" step="0.1" value="1.2"></div>
+  <div class="g"><label>Warp (time)</label><input id="warp" type="range" min="0.1" max="3" step="0.01" value="1.0"></div>
+  <div class="g"><label>Explode Rate</label><input id="rate" type="range" min="0" max="3" step="0.01" value="0.7"></div>
+  <div class="g"><label>Explode Power</label><input id="power" type="range" min="0" max="1200" step="10" value="520"></div>
+  <button id="explode">💥 Explode</button>
+  <button id="random">🎲 Randomize</button>
+  <button id="pause">⏸ Pause</button>
+  <span id="fps"></span>
 </div>
 
-<audio id="player" playsinline preload="metadata"></audio>
-
 <script>
-const canvas = document.getElementById("c");
-const ctx = canvas.getContext("2d");
-const statusEl = document.getElementById("status");
-const player = document.getElementById("player");
-const vol = document.getElementById("vol");
-const loadBtn = document.getElementById("loadBtn");
-const playBtn = document.getElementById("playBtn");
-const pauseBtn = document.getElementById("pauseBtn");
+(() => {
+  // Canvas setup
+  const $ = s => document.querySelector(s);
+  const cv = $('#c');
+  const ctx = cv.getContext('2d', { alpha:false, desynchronized:true });
+  let DPR = Math.max(1, Math.min(devicePixelRatio || 1, 2));
+  let W=0, H=0;
+  function resize(){ W = cv.width = Math.floor(innerWidth * DPR); H = cv.height = Math.floor(innerHeight * DPR); }
+  addEventListener('resize', resize, {passive:true}); resize();
 
-let W,H,DPR=Math.max(1,Math.min(window.devicePixelRatio||1,2));
-function resize(){ W=canvas.width=innerWidth*DPR; H=canvas.height=innerHeight*DPR; }
-addEventListener("resize",resize,{passive:true}); resize();
-
-function setStatus(msg){ statusEl.textContent = msg || ""; }
-function stat() {
-  const rsMap = ["HAVE_NOTHING","HAVE_METADATA","HAVE_CURRENT_DATA","HAVE_FUTURE_DATA","HAVE_ENOUGH_DATA"];
-  const rs = player.readyState!=null ? rsMap[player.readyState] || player.readyState : "?";
-  const d = isFinite(player.duration) ? player.duration.toFixed(2) : "—";
-  setStatus(`state:${rs} dur:${d}s`);
-}
-
-// ---- Audio graph ----
-let actx, analyser, dataArray, srcNode, gainNode, urlRef=null, started=false;
-
-function ensureAudio(){
-  if (actx) return;
-  const AC = window.AudioContext || window.webkitAudioContext;
-  actx = new AC({ latencyHint: "interactive" });
-
-  analyser = actx.createAnalyser();
-  analyser.fftSize = 512;
-  dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-  gainNode = actx.createGain();
-  gainNode.gain.value = +vol.value;
-  gainNode.connect(actx.destination);
-  vol.oninput = () => { if (gainNode) gainNode.gain.value = +vol.value; };
-
-  // Create MediaElementSource ONCE (lifetime of the element)
-  srcNode = actx.createMediaElementSource(player);
-  srcNode.connect(analyser);
-  srcNode.connect(gainNode);
-
-  // Mute element’s own output to avoid double audio; WebAudio path handles sound
-  player.muted = true;
-}
-
-async function resumeCtx(){
-  if (actx && actx.state !== "running") { try { await actx.resume(); } catch(_) {} }
-}
-
-function revokeOldURL(){ if (urlRef) { URL.revokeObjectURL(urlRef); urlRef = null; } }
-
-// Load via picker
-loadBtn.onclick = async () => {
-  ensureAudio();
-  await resumeCtx();
-
-  const inp = document.createElement("input");
-  inp.type = "file";
-  // Leave accept empty to allow any; iOS will refuse unsupported codecs.
-  // inp.accept = ".mp3,.m4a,.aac,.wav,.alac,.aif,.aiff,.caf,.flac,.ogg";
-  inp.onchange = async () => {
-    if (!(inp.files && inp.files[0])) return;
-    const file = inp.files[0];
-
-    // Reset element to a clean state
-    player.removeAttribute("src");
-    player.load();
-
-    revokeOldURL();
-    urlRef = URL.createObjectURL(file);
-    player.src = urlRef;
-    player.loop = true;
-
-    setStatus("Loading metadata…");
-    // Force a load cycle so iOS fetches metadata
-    player.load();
-
-    // Wait for metadata (duration becomes known); then try canplay
-    await new Promise((res, rej) => {
-      const onMeta = () => { stat(); cleanup(); res(); };
-      const onErr = () => { setStatus("Error loading file (unsupported?)"); cleanup(); res(); };
-      const cleanup = () => {
-        player.removeEventListener("loadedmetadata", onMeta);
-        player.removeEventListener("error", onErr);
-      };
-      player.addEventListener("loadedmetadata", onMeta, { once:true });
-      player.addEventListener("error", onErr, { once:true });
-    });
-
-    // Optional: wait for canplay to be extra safe
-    await new Promise((res) => {
-      if (player.readyState >= 3) return res();
-      const onCP = () => { res(); player.removeEventListener("canplay", onCP); };
-      player.addEventListener("canplay", onCP);
-      // Also resolve after short timeout to avoid hanging
-      setTimeout(res, 250);
-    });
-
-    stat();
+  // Params (sliders)
+  const UI = {
+    nodes: $('#nodes'),
+    radius: $('#radius'),
+    trail: $('#trail'),
+    glitch: $('#glitch'),
+    tele:  $('#tele'),
+    thick: $('#thick'),
+    warp:  $('#warp'),
+    rate:  $('#rate'),
+    power: $('#power'),
   };
-  inp.click();
-};
 
-// Play/Pause
-playBtn.onclick = async () => {
-  ensureAudio();
-  await resumeCtx();
-  try { await player.play(); started = true; stat(); }
-  catch(e){
-    // As fallback, expose native controls; one tap on Play always works
-    player.controls = true;
-    player.style.display = "block";
-    setStatus("Tap Play on the control bar to start.");
+  // State
+  let nodes = [];
+  let playing = true;
+  let last = performance.now();
+  let timeScale = +UI.warp.value;
+  let explodeCooldown = 0;
+
+  // Helpers
+  function rnd(a=1){ return Math.random()*a; }
+  function rndN(n=1){ return (Math.random()*2-1)*n; }
+
+  function makeNodes(N){
+    nodes = new Array(N).fill(0).map(()=>({
+      x: rnd(W), y: rnd(H),
+      vx: rndN(1.5), vy: rndN(1.5),
+      r: 1.5 + Math.random()*3.5,
+      hue: 160 + Math.random()*200
+    }));
   }
-};
-pauseBtn.onclick = () => { try { player.pause(); stat(); } catch(_){} };
+  makeNodes(+UI.nodes.value);
 
-// Media events to keep you informed
-player.addEventListener("loadedmetadata", stat);
-player.addEventListener("canplay", stat);
-player.addEventListener("timeupdate", stat);
-player.addEventListener("error", () => {
-  const err = player.error;
-  let msg = "Playback error.";
-  if (err) {
-    const map = {1:"aborted",2:"network",3:"decode",4:"src not supported"};
-    msg = `Playback error (${map[err.code]||err.code}).`;
+  // UI actions
+  $('#explode').onclick = () => burst(+UI.power.value);
+  $('#random').onclick = () => randomizePalette();
+  $('#pause').onclick = () => { playing=!playing; $('#pause').textContent = playing ? '⏸ Pause' : '▶️ Play'; };
+  UI.nodes.oninput = () => makeNodes(+UI.nodes.value);
+  UI.warp.oninput = () => timeScale = +UI.warp.value;
+
+  function randomizePalette(){
+    for (const n of nodes) n.hue = (Math.random()*360)|0;
   }
-  setStatus(msg + " Try MP3, M4A/AAC, WAV, or ALAC on iPhone.");
-  player.controls = true;
-  player.style.display = "block";
-});
 
-// ---- Visuals: glitchy architectural network ----
-const N=160, nodes=[];
-for(let i=0;i<N;i++){
-  nodes.push({ x:Math.random()*W, y:Math.random()*H,
-               vx:(Math.random()-0.5)*2, vy:(Math.random()-0.5)*2,
-               r:2+Math.random()*3 });
-}
-
-function energy(){
-  if(!started || !analyser) return 0;
-  analyser.getByteFrequencyData(dataArray);
-  let s=0; for (let v of dataArray) s+=v;
-  return s/(dataArray.length*255);
-}
-
-function draw(){
-  ctx.fillStyle = "rgba(0,0,0,0.25)";
-  ctx.fillRect(0,0,W,H);
-
-  const e = energy();
-  // Architecture + glitches
-  for (let n of nodes){
-    if (Math.random() < 0.025 + e*0.08) {
-      n.vx += (Math.random()-0.5)*12*e;
-      n.vy += (Math.random()-0.5)*12*e;
-      if (Math.random() < 0.004 + e*0.012) { n.x = Math.random()*W; n.y = Math.random()*H; }
+  // Burst = radial impulse from a random point
+  function burst(P=600){
+    const cx = rnd(W), cy = rnd(H);
+    for (const n of nodes){
+      const dx = n.x - cx, dy = n.y - cy;
+      const d = Math.hypot(dx,dy)+1e-3;
+      const f = (P / d); // stronger when closer
+      n.vx += (dx/d) * f;
+      n.vy += (dy/d) * f;
     }
-    n.x += n.vx; n.y += n.vy;
-    if (n.x<0||n.x>W) n.vx*=-1;
-    if (n.y<0||n.y>H) n.vy*=-1;
-
-    ctx.beginPath();
-    ctx.arc(n.x,n.y,n.r,0,Math.PI*2);
-    ctx.fillStyle = `hsl(${170+e*210},80%,${45+e*40}%)`;
-    ctx.fill();
   }
 
-  const reach = 120 + e*240;
-  ctx.lineWidth = 0.8 + e*2.4;
-  for (let i=0;i<N;i++){
-    for (let j=i+1;j<N;j++){
-      const dx=nodes[i].x-nodes[j].x, dy=nodes[i].y-nodes[j].y, d=Math.hypot(dx,dy);
-      if (d < reach){
-        const a = 1 - d/(reach+1);
-        ctx.strokeStyle = `rgba(180,210,255,${0.07 + a*0.55})`;
-        ctx.beginPath();
-        ctx.moveTo(nodes[i].x, nodes[i].y);
-        const mx = (nodes[i].x + nodes[j].x)/2 + (Math.random()-0.5)*8*e;
-        const my = (nodes[i].y + nodes[j].y)/2 + (Math.random()-0.5)*8*e;
-        ctx.lineTo(mx, my);
-        ctx.lineTo(nodes[j].x, nodes[j].y);
-        ctx.stroke();
+  // Scheduled explosions (stochastic, rate slider)
+  function autoExplode(dt){
+    explodeCooldown -= dt;
+    const rate = +UI.rate.value; // events/sec (approx)
+    if (rate <= 0) return;
+    if (explodeCooldown <= 0){
+      if (Math.random() < rate * dt) {
+        burst(+UI.power.value * (0.6 + Math.random()*0.8));
+        explodeCooldown = 0.1; // minimal spacing so they look discrete
       }
     }
   }
 
+  // Draw loop
+  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
+  function draw(t){
+    const now = t, dtRaw = Math.max(0, (now - last) / 1000); last = now;
+    const dt = dtRaw * timeScale;
+    if (playing){
+      // Trails: draw translucent black
+      const trail = +UI.trail.value;
+      if (trail <= 0) { ctx.clearRect(0,0,W,H); }
+      else { ctx.fillStyle = `rgba(0,0,0,${trail})`; ctx.fillRect(0,0,W,H); }
+
+      // Physics
+      const jitter = +UI.glitch.value;         // random velocity kicks
+      const teleP  = +UI.tele.value;           // random teleports per node per second
+      const linkR  = +UI.radius.value;         // base link radius
+      const thick  = +UI.thick.value;          // edge thickness
+
+      autoExplode(dt);
+
+      for (const n of nodes){
+        // Glitchy jitter
+        if (Math.random() < (0.8*jitter) * dt) {
+          n.vx += rndN(60*jitter) * dt;
+          n.vy += rndN(60*jitter) * dt;
+        }
+        // Occasional teleport for warp-y feel
+        if (Math.random() < teleP * dt) {
+          n.x = rnd(W); n.y = rnd(H);
+        }
+
+        // Integrate
+        n.x += n.vx * dt * 60;
+        n.y += n.vy * dt * 60;
+
+        // Soft boundary bounce
+        if (n.x < 0) { n.x = 0; n.vx = Math.abs(n.vx); }
+        if (n.x > W) { n.x = W; n.vx = -Math.abs(n.vx); }
+        if (n.y < 0) { n.y = 0; n.vy = Math.abs(n.vy); }
+        if (n.y > H) { n.y = H; n.vy = -Math.abs(n.vy); }
+
+        // Node dots
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
+        ctx.fillStyle = `hsl(${n.hue},85%,${45 + Math.min(40, (Math.hypot(n.vx,n.vy)) )}%)`;
+        ctx.fill();
+      }
+
+      // Edges / scaffolding (two-pass for depth feel)
+      const N = nodes.length;
+      ctx.lineCap = 'round';
+      for (let pass=0; pass<2; pass++){
+        ctx.lineWidth = (thick * (pass?1:0.5));
+        for (let i=0;i<N;i++){
+          for (let j=i+1;j<N;j++){
+            const a = nodes[i], b = nodes[j];
+            const dx = a.x - b.x, dy = a.y - b.y;
+            const d = Math.hypot(dx,dy);
+            const reach = linkR * (pass?1.0:0.6);
+            if (d < reach){
+              const fade = 1 - d / reach;
+              ctx.strokeStyle = `rgba(${180+pass*40},${210-pass*20},255,${0.06 + fade*0.5})`;
+              // Slight mid-segment warp for glitch vibe
+              const mx = (a.x+b.x)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
+              const my = (a.y+b.y)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
+              ctx.beginPath();
+              ctx.moveTo(a.x, a.y);
+              ctx.lineTo(mx, my);
+              ctx.lineTo(b.x, b.y);
+              ctx.stroke();
+            }
+          }
+        }
+      }
+    }
+
+    // Simple FPS readout (smoothed)
+    fpsAcc += 1/dtRaw; fpsFrames++; fpsT += dtRaw;
+    if (fpsT > 0.5) { fpsEl.textContent = `${(fpsAcc/fpsFrames).toFixed(0)} fps`; fpsAcc=0; fpsFrames=0; fpsT=0; }
+
+    requestAnimationFrame(draw);
+  }
   requestAnimationFrame(draw);
-}
-draw();
+
+  // Initial flourish
+  setTimeout(()=> burst(+UI.power.value*0.8), 300);
+})();
 </script>
 </body>
 </html>
