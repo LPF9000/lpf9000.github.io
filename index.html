@@ -15,8 +15,7 @@
     display:flex; gap:10px; flex-wrap:wrap; align-items:center;
     background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.2);
     border-radius:12px; padding:10px 12px; font:14px system-ui, sans-serif; color:#fff;
-    max-width:min(950px, calc(100vw - 20px));
-    z-index:10;
+    max-width:min(950px, calc(100vw - 20px)); z-index:10;
   }
   .g { display:flex; flex-direction:column; gap:2px; }
   .g label { font-size:12px; opacity:.85 }
@@ -35,10 +34,6 @@
     display:flex; align-items:center; gap:8px; z-index:10;
   }
   #uiToggle { width:18px; height:18px; }
-  #flash {
-    position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; z-index:5;
-    transition: opacity .18s ease-out;
-  }
 </style>
 </head>
 <body>
@@ -53,9 +48,7 @@
   <div class="g"><label>Teleport</label><input id="tele" type="range" min="0" max="0.05" step="0.001" value="0.006"></div>
   <div class="g"><label>Edge Thicc</label><input id="thick" type="range" min="0.4" max="4" step="0.1" value="1.2"></div>
   <div class="g"><label>Warp (time)</label><input id="warp" type="range" min="0.1" max="3" step="0.01" value="1.0"></div>
-  <div class="g"><label>Explode Rate</label><input id="rate" type="range" min="0" max="3" step="0.01" value="0.7"></div>
-  <div class="g"><label>Explode Power</label><input id="power" type="range" min="0" max="1200" step="10" value="520"></div>
-  <button id="explode" type="button">💥 Explode</button>
+  <div class="g"><label>Feedback (echo)</label><input id="feedback" type="range" min="0" max="1" step="0.01" value="0.12"></div>
   <button id="random"  type="button">🎲 Randomize</button>
   <button id="pause"   type="button">⏸ Pause</button>
   <span id="fps"></span>
@@ -67,18 +60,23 @@
   <label for="uiToggle">Show controls</label>
 </div>
 
-<!-- Quick flash layer for explosions -->
-<div id="flash"></div>
-
 <script>
 (() => {
-  // Canvas setup
   const $ = s => document.querySelector(s);
+
+  // Canvas + offscreen feedback layer
   const cv = $('#c');
   const ctx = cv.getContext('2d', { alpha:false, desynchronized:true });
+  const fb = document.createElement('canvas');
+  const fbc = fb.getContext('2d', { alpha:false });
+
   let DPR = Math.max(1, Math.min(devicePixelRatio || 1, 2));
   let W=0, H=0;
-  function resize(){ W = cv.width = Math.floor(innerWidth * DPR); H = cv.height = Math.floor(innerHeight * DPR); }
+  function resize(){
+    W = cv.width = Math.floor(innerWidth * DPR);
+    H = cv.height = Math.floor(innerHeight * DPR);
+    fb.width = W; fb.height = H;
+  }
   addEventListener('resize', resize, {passive:true}); resize();
 
   // UI
@@ -96,8 +94,7 @@
     tele:  $('#tele'),
     thick: $('#thick'),
     warp:  $('#warp'),
-    rate:  $('#rate'),
-    power: $('#power'),
+    feedback: $('#feedback'),
   };
 
   // State
@@ -105,16 +102,8 @@
   let playing = true;
   let last = performance.now();
   let timeScale = +UI.warp.value;
-  let explodeCooldown = 0;
 
   // Helpers
-  const flashEl = $('#flash');
-  function screenFlash() {
-    flashEl.style.opacity = '0.35';
-    // force reflow then fade out
-    requestAnimationFrame(() => { flashEl.style.opacity = '0'; });
-  }
-
   function rnd(a=1){ return Math.random()*a; }
   function rndN(n=1){ return (Math.random()*2-1)*n; }
 
@@ -128,101 +117,99 @@
   }
   makeNodes(+UI.nodes.value);
 
-  // UI actions (ensure they’re bound and visible on mobile)
-  $('#explode').addEventListener('click', () => burst(+UI.power.value));
-  $('#random').addEventListener('click', () => randomize());
-  $('#pause').addEventListener('click', () => {
-    playing=!playing; $('#pause').textContent = playing ? '⏸ Pause' : '▶️ Play';
-  });
-  UI.nodes.addEventListener('input', () => makeNodes(+UI.nodes.value));
-  UI.warp.addEventListener('input', () => timeScale = +UI.warp.value);
-
-  // Randomize now also re-seeds velocities so it’s clearly different
-  function randomize(){
-    for (const n of nodes){
+  // Randomize ALL sliders + palette + velocities
+  function randomizeAll(){
+    // Randomize every range input in the panel
+    panel.querySelectorAll('input[type="range"]').forEach(inp => {
+      const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
+      // pick a value that aligns with step
+      const raw = min + Math.random()*(max-min);
+      const decimals = (step.toString().split('.')[1]||'').length;
+      inp.value = raw.toFixed(decimals);
+    });
+    // Apply side-effects
+    timeScale = +UI.warp.value;
+    makeNodes(+UI.nodes.value);
+    // New hues + fresh motion
+    nodes.forEach(n => {
       n.hue = (Math.random()*360)|0;
       const speed = 1.5 + Math.random()*3.0;
       const ang = Math.random()*Math.PI*2;
       n.vx = Math.cos(ang)*speed;
       n.vy = Math.sin(ang)*speed;
-    }
+    });
   }
 
-  // Burst = stronger radial impulse with distance falloff + flash
-  function burst(P=600){
-    const cx = rnd(W*0.6) + W*0.2;   // bias toward center-ish
-    const cy = rnd(H*0.6) + H*0.2;
-    const base = Math.max(100, P);
-    for (const n of nodes){
-      const dx = n.x - cx, dy = n.y - cy;
-      const d = Math.hypot(dx,dy) + 1e-3;
-      // inverse-square-ish falloff, clamped
-      const f = Math.min(base / (d*d*0.002 + 1), base*0.02);
-      const nx = dx / d, ny = dy / d;
-      n.vx += nx * f;
-      n.vy += ny * f;
-    }
-    screenFlash();
-  }
-
-  // Scheduled explosions (stochastic, rate slider) — more frequent & obvious
-  function autoExplode(dt){
-    explodeCooldown -= dt;
-    const rate = +UI.rate.value; // events/sec (approx)
-    if (rate <= 0) return;
-    if (explodeCooldown <= 0 && Math.random() < rate * dt) {
-      burst(+UI.power.value * (0.7 + Math.random()*1.0));
-      explodeCooldown = 0.12;
-    }
-  }
+  // Bind UI
+  $('#random').addEventListener('click', randomizeAll);
+  $('#pause').addEventListener('click', () => {
+    playing=!playing; $('#pause').textContent = playing ? '⏸ Pause' : '▶️ Play';
+  });
+  UI.nodes.addEventListener('input', () => makeNodes(+UI.nodes.value));
+  UI.warp.addEventListener('input', () => (timeScale = +UI.warp.value));
 
   // Draw loop
   const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
   function draw(t){
     const now = t, dtRaw = Math.max(0, (now - last) / 1000); last = now;
     const dt = dtRaw * timeScale;
+
     if (playing){
-      // Trails
+      // 1) Feedback echo (previous frame) — subtle scale/rotate + additive blend
+      const fbAmt = +UI.feedback.value; // 0..1
+      if (fbAmt > 0) {
+        ctx.save();
+        ctx.globalAlpha = Math.min(0.9, fbAmt * 0.6);
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.translate(W/2, H/2);
+        const s = 1 + fbAmt * 0.004;     // very slight scale
+        const r = fbAmt * 0.0015;        // very slight rotation
+        ctx.scale(s, s);
+        ctx.rotate(r);
+        ctx.translate(-W/2, -H/2);
+        ctx.drawImage(fb, 0, 0, W, H);
+        ctx.restore();
+        ctx.globalCompositeOperation = 'source-over';
+      }
+
+      // 2) Trails (motion persistence)
       const trail = +UI.trail.value;
       if (trail <= 0) { ctx.clearRect(0,0,W,H); }
       else { ctx.fillStyle = `rgba(0,0,0,${trail})`; ctx.fillRect(0,0,W,H); }
 
-      // Params
+      // 3) Physics + draw nodes
       const jitter = +UI.glitch.value;
       const teleP  = +UI.tele.value;
       const linkR  = +UI.radius.value;
       const thick  = +UI.thick.value;
 
-      autoExplode(dt);
-
-      // Physics + draw nodes
       for (const n of nodes){
-        // Glitchy random kicks (scaled with dt)
+        // random kicks
         if (Math.random() < (0.8*jitter) * dt) {
           n.vx += rndN(80*jitter) * dt;
           n.vy += rndN(80*jitter) * dt;
         }
-        // Teleport
+        // rare teleport
         if (Math.random() < teleP * dt) { n.x = rnd(W); n.y = rnd(H); }
 
-        // Integrate
+        // integrate
         n.x += n.vx * dt * 60;
         n.y += n.vy * dt * 60;
 
-        // Soft boundary bounce
+        // boundary bounce
         if (n.x < 0) { n.x = 0; n.vx = Math.abs(n.vx); }
         if (n.x > W) { n.x = W; n.vx = -Math.abs(n.vx); }
         if (n.y < 0) { n.y = 0; n.vy = Math.abs(n.vy); }
         if (n.y > H) { n.y = H; n.vy = -Math.abs(n.vy); }
 
-        // Node dots
+        // node dot
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
         ctx.fillStyle = `hsl(${n.hue},85%,${45 + Math.min(40, Math.hypot(n.vx,n.vy))}%)`;
         ctx.fill();
       }
 
-      // Edges / scaffolding (two-pass for depth)
+      // 4) Edges / scaffolding (two-pass for depth)
       const N = nodes.length;
       ctx.lineCap = 'round';
       for (let pass=0; pass<2; pass++){
@@ -237,7 +224,7 @@
             if (d < reach){
               const fade = 1 - d / reach;
               ctx.strokeStyle = `rgba(${180+pass*40},${210-pass*20},255,${0.06 + fade*0.5})`;
-              // Mid-segment warp for glitch vibe
+              // mid-segment warp for glitch vibe
               const mx = (a.x+b.x)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
               const my = (a.y+b.y)/2 + rndN(6 + 40*jitter*fade) * dt * 60;
               ctx.beginPath();
@@ -249,6 +236,10 @@
           }
         }
       }
+
+      // 5) Update feedback buffer for next frame
+      fbc.clearRect(0,0,W,H);
+      fbc.drawImage(cv, 0, 0, W, H);
     }
 
     // FPS
@@ -257,10 +248,11 @@
 
     requestAnimationFrame(draw);
   }
+  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
   requestAnimationFrame(draw);
 
-  // Initial flourish
-  setTimeout(()=> burst(+UI.power.value*0.9), 350);
+  // Nice little starting motion
+  setTimeout(()=> randomizeAll(), 250);
 })();
 </script>
 </body>
