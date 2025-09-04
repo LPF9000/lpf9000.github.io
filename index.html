@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>glitch-network (iOS fixed)</title>
+<title>glitch-network (mobile-safe)</title>
 <style>
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
   canvas { display:block; width:100vw; height:100vh; touch-action:none; }
@@ -11,15 +11,15 @@
     position:fixed; top:12px; left:50%; transform:translateX(-50%);
     background:rgba(0,0,0,.45); padding:10px 16px; border-radius:12px;
     font-family:system-ui, sans-serif; font-size:16px; color:#fff;
-    border:1px solid rgba(255,255,255,.25); display:flex; gap:10px; align-items:center;
+    border:1px solid rgba(255,255,255,.25); display:flex; gap:10px; align-items:center; flex-wrap:wrap;
   }
   button {
     appearance:none; background:#111; border:1px solid #59f; border-radius:8px;
-    color:#59f; padding:10px 20px; font-size:16px; cursor:pointer;
+    color:#59f; padding:10px 16px; font-size:16px; cursor:pointer;
   }
   input[type="range"]{ width:120px; }
   #status { font-size:12px; color:#9af; opacity:.95 }
-  /* Only show native controls if autoplay is blocked */
+  /* Native controls are hidden unless we really need them */
   #player { position:fixed; left:12px; bottom:12px; width:calc(100% - 24px); display:none; }
 </style>
 </head>
@@ -27,15 +27,17 @@
 <canvas id="c"></canvas>
 
 <div id="ui">
-  <button id="fileBtn">🎵 Load / Play</button>
+  <button id="loadBtn">📁 Load</button>
+  <button id="playBtn">▶️ Play</button>
+  <button id="pauseBtn">⏸ Pause</button>
   <label style="display:flex;align-items:center;gap:6px;">
     Vol <input id="vol" type="range" min="0" max="1" step="0.01" value="1">
   </label>
   <span id="status"></span>
 </div>
 
-<!-- Hidden audio element (used as source; we mute it and route via WebAudio) -->
-<audio id="player" playsinline></audio>
+<!-- Hidden audio element (decoded by Safari). We route it via WebAudio. -->
+<audio id="player" playsinline preload="auto"></audio>
 
 <script>
 const canvas = document.getElementById("c");
@@ -43,6 +45,9 @@ const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const player = document.getElementById("player");
 const vol = document.getElementById("vol");
+const loadBtn = document.getElementById("loadBtn");
+const playBtn = document.getElementById("playBtn");
+const pauseBtn = document.getElementById("pauseBtn");
 
 let W,H,DPR=Math.max(1,Math.min(window.devicePixelRatio||1,2));
 function resize(){ W=canvas.width=innerWidth*DPR; H=canvas.height=innerHeight*DPR; }
@@ -50,7 +55,7 @@ addEventListener("resize",resize,{passive:true}); resize();
 
 function setStatus(msg){ statusEl.textContent = msg || ""; }
 
-// ---- iOS-safe audio path ----
+// ---- Audio: <audio> + WebAudio routing ----
 let actx, analyser, dataArray, srcNode, gainNode, urlRef=null, started=false;
 
 function ensureAudio(){
@@ -68,66 +73,96 @@ function ensureAudio(){
   vol.oninput = () => { if (gainNode) gainNode.gain.value = +vol.value; };
 }
 
-async function loadAndPlayFile(file){
-  // revoke previous blob URL
-  if (urlRef) { URL.revokeObjectURL(urlRef); urlRef = null; }
+async function resumeCtx(){ if (actx && actx.state !== "running") { try { await actx.resume(); } catch(_) {} } }
 
-  ensureAudio();
-  try { await actx.resume(); } catch(_) {}
-
-  // Use <audio> as the decoder/player
-  urlRef = URL.createObjectURL(file);
-  player.src = urlRef;
-  player.loop = true;
-
-  // IMPORTANT: when we use MediaElementSource, the element doesn't go to speakers by itself.
-  // We mute the element and route via WebAudio to the destination.
+function bindGraphOnce(){
+  if (srcNode) return;
+  // One MediaElementSource per <audio> for lifetime
+  srcNode = actx.createMediaElementSource(player);
+  srcNode.connect(analyser);     // visuals
+  srcNode.connect(gainNode);     // speakers
+  // IMPORTANT: mute element's own output to avoid double audio; WebAudio handles playback
   player.muted = true;
-
-  if (!srcNode) {
-    srcNode = actx.createMediaElementSource(player);
-    // Visuals tap
-    srcNode.connect(analyser);
-    // Audio out path
-    srcNode.connect(gainNode);   // <-- this is the missing link to speakers
-  }
-
-  try {
-    await player.play();
-    started = true;
-    setStatus("");
-    // Hide native controls (we’re handling playback)
-    player.style.display = "none";
-  } catch (e) {
-    // If iOS blocks this, show native controls so user can press Play once
-    player.style.display = "block";
-    player.controls = true;
-    setStatus("Tap Play on the control bar to start audio.");
-  }
 }
 
-document.getElementById("fileBtn").onclick = () => {
+function revokeOldURL(){ if (urlRef) { URL.revokeObjectURL(urlRef); urlRef = null; } }
+
+async function loadFileViaPicker(){
+  ensureAudio();
+  await resumeCtx();
+
   const inp = document.createElement("input");
   inp.type = "file";
-  inp.accept = ".mp3,.wav,.ogg,.flac,.aac,.m4a";
-  inp.onchange = () => { if (inp.files && inp.files[0]) loadAndPlayFile(inp.files[0]); };
-  inp.click();
-};
+  // If you truly want "any file", leave accept empty; we’ll error if unsupported.
+  // inp.accept = "";
+  // If you want to hint, uncomment:
+  // inp.accept = ".mp3,.m4a,.aac,.wav,.alac,.aif,.aiff,.caf,.flac,.ogg";
+  inp.onchange = async () => {
+    if (!(inp.files && inp.files[0])) return;
+    const file = inp.files[0];
+    revokeOldURL();
+    ensureAudio();
+    bindGraphOnce();
 
-// If user presses Play on native controls, make sure context is running
-player.addEventListener("play", async () => {
-  try { await actx.resume(); } catch(_) {}
-  started = true; setStatus("");
+    // Point <audio> at blob URL
+    urlRef = URL.createObjectURL(file);
+    player.src = urlRef;
+    player.loop = true;
+    setStatus("Loading…");
+
+    try { await player.play(); started = true; setStatus(""); }
+    catch(e){
+      // If autoplay disallowed, show native controls so user can press Play
+      player.controls = true;
+      player.style.display = "block";
+      setStatus("Tap Play on the control bar to start.");
+    }
+  };
+  inp.click();
+}
+
+async function play(){
+  ensureAudio();
+  bindGraphOnce();
+  await resumeCtx();
+  try { await player.play(); started = true; setStatus(""); }
+  catch(e){
+    player.controls = true;
+    player.style.display = "block";
+    setStatus("Tap Play on the control bar to start.");
+  }
+}
+function pause(){ try { player.pause(); } catch(_){} }
+
+// Handle media errors (unsupported codec, bad file, etc.)
+player.addEventListener("error", () => {
+  const err = player.error;
+  let msg = "Playback error.";
+  if (err){
+    // MediaError codes: 1 ABORTED, 2 NETWORK, 3 DECODE, 4 SRC_NOT_SUPPORTED
+    const map = {1:"aborted",2:"network",3:"decode",4:"src not supported"};
+    msg = `Playback error (${map[err.code]||err.code}).`;
+  }
+  setStatus(msg + " Try MP3, M4A/AAC, WAV, or ALAC on iPhone.");
+  // Expose native controls so user can try again or scrub
+  player.controls = true;
+  player.style.display = "block";
 });
 
+// Ensure graph is live if user taps Play on native controls
+player.addEventListener("play", async () => { await resumeCtx(); started = true; setStatus(""); });
+
+// UI buttons
+loadBtn.onclick = loadFileViaPicker;
+playBtn.onclick = play;
+pauseBtn.onclick = pause;
+
 // ---- Visuals: glitchy architectural network ----
-const N=140, nodes=[];
+const N=160, nodes=[];
 for(let i=0;i<N;i++){
-  nodes.push({
-    x:Math.random()*W, y:Math.random()*H,
-    vx:(Math.random()-0.5)*2, vy:(Math.random()-0.5)*2,
-    r:2+Math.random()*3
-  });
+  nodes.push({ x:Math.random()*W, y:Math.random()*H,
+               vx:(Math.random()-0.5)*2, vy:(Math.random()-0.5)*2,
+               r:2+Math.random()*3 });
 }
 
 function energy(){
@@ -142,36 +177,38 @@ function draw(){
   ctx.fillRect(0,0,W,H);
 
   const e = energy();
-  if (!started) setStatus("Tap ‘Load / Play’ and choose a file");
+  if (!started) setStatus("Tap Load, choose a file, then Play.");
 
+  // More chaotic “architecture” feel
   for (let n of nodes){
-    if (Math.random() < 0.02 + e*0.06) {
-      n.vx += (Math.random()-0.5)*10*e;
-      n.vy += (Math.random()-0.5)*10*e;
-      if (Math.random() < 0.003 + e*0.01) { n.x = Math.random()*W; n.y = Math.random()*H; }
+    if (Math.random() < 0.025 + e*0.08) {
+      n.vx += (Math.random()-0.5)*12*e;
+      n.vy += (Math.random()-0.5)*12*e;
+      if (Math.random() < 0.004 + e*0.012) { n.x = Math.random()*W; n.y = Math.random()*H; }
     }
     n.x += n.vx; n.y += n.vy;
-    if (n.x<0||n.x>W) n.vx *= -1;
-    if (n.y<0||n.y>H) n.vy *= -1;
+    if (n.x<0||n.x>W) n.vx*=-1;
+    if (n.y<0||n.y>H) n.vy*=-1;
 
     ctx.beginPath();
     ctx.arc(n.x,n.y,n.r,0,Math.PI*2);
-    ctx.fillStyle = `hsl(${180+e*200},80%,${45+e*40}%)`;
+    ctx.fillStyle = `hsl(${170+e*210},80%,${45+e*40}%)`;
     ctx.fill();
   }
 
-  ctx.lineWidth = 0.8 + e*2.2;
+  // Edges / scaffolding with mid-segment jitter
+  const reach = 120 + e*240;
+  ctx.lineWidth = 0.8 + e*2.4;
   for (let i=0;i<N;i++){
     for (let j=i+1;j<N;j++){
       const dx=nodes[i].x-nodes[j].x, dy=nodes[i].y-nodes[j].y, d=Math.hypot(dx,dy);
-      const reach = 110 + e*220;
       if (d < reach){
         const a = 1 - d/(reach+1);
-        ctx.strokeStyle = `rgba(180,210,255,${0.08 + a*0.5})`;
+        ctx.strokeStyle = `rgba(180,210,255,${0.07 + a*0.55})`;
         ctx.beginPath();
         ctx.moveTo(nodes[i].x, nodes[i].y);
-        const mx = (nodes[i].x + nodes[j].x)/2 + (Math.random()-0.5)*6*e;
-        const my = (nodes[i].y + nodes[j].y)/2 + (Math.random()-0.5)*6*e;
+        const mx = (nodes[i].x + nodes[j].x)/2 + (Math.random()-0.5)*8*e;
+        const my = (nodes[i].y + nodes[j].y)/2 + (Math.random()-0.5)*8*e;
         ctx.lineTo(mx, my);
         ctx.lineTo(nodes[j].x, nodes[j].y);
         ctx.stroke();
