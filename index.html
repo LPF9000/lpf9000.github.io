@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>micro-glitch</title>
+<style>
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#000; font-family: system-ui, sans-serif; }
+  #ui {
+    position: fixed; inset: 0 auto auto 0; margin: 12px; display:flex; gap:8px; flex-wrap:wrap;
+    background: rgba(0,0,0,.35); backdrop-filter: blur(6px); border:1px solid rgba(255,255,255,.08);
+    border-radius: 10px; padding:8px 10px; align-items:center;
+  }
+  button, label, input[type="range"] {
+    appearance: none; border:1px solid rgba(255,255,255,.2); background: rgba(255,255,255,.06);
+    color:#fff; padding:6px 10px; border-radius:8px; font-size:14px; cursor:pointer;
+  }
+  input[type="range"]{ width:140px; height:28px; cursor:ew-resize; }
+  #hint { color:#9ad; font-size:12px; opacity:.8; margin-left:6px }
+  canvas { display:block; width:100vw; height:100vh; }
+  #drop {
+    position:fixed; inset:0; display:none; place-items:center; color:#9ad; background:rgba(0,0,20,.75);
+    border:2px dashed #59f; font-size:18px; pointer-events:none;
+  }
+  .pill { font-size:12px; padding:4px 8px; border-radius:999px; opacity:.85 }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="drop">Drop an audio file anywhere…</div>
+
+<div id="ui">
+  <button id="mic">🎤 Use Mic</button>
+  <button id="file">🎵 Load Audio</button>
+  <label class="pill">Glitch <input id="glitch" type="range" min="0" max="1" step="0.01" value="0.6"></label>
+  <label class="pill">Intensity <input id="intensity" type="range" min="0" max="1.25" step="0.01" value="0.9"></label>
+  <label class="pill">Scanlines <input id="scan" type="range" min="0" max="1" step="0.01" value="0.35"></label>
+  <label class="pill">FX <input id="fx" type="range" min="0" max="1" step="0.01" value="0.5"></label>
+  <button id="pause">⏸ Pause</button>
+  <span id="hint">Tip: press <b>M</b> for mic, <b>O</b> to open file, drag an audio file onto the page.</span>
+</div>
+
+<script>
+(() => {
+  // --- tiny helpers ---
+  const $ = sel => document.querySelector(sel);
+  const canvas = $('#c');
+  const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
+  const drop = $('#drop');
+  let W = 0, H = 0, DPR = Math.max(1, Math.min(window.devicePixelRatio||1, 2));
+  const resize = () => { W = canvas.width = Math.floor(innerWidth * DPR); H = canvas.height = Math.floor(innerHeight * DPR); };
+  addEventListener('resize', resize, { passive:true }); resize();
+
+  // --- audio ---
+  let actx, analyser, srcNode, dataArray, playing = true, started = false, audioBufferSource = null;
+  const FFT_SIZE = 2048;
+
+  function ensureAudio() {
+    if (actx) return;
+    actx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+    analyser = actx.createAnalyser();
+    analyser.fftSize = FFT_SIZE;
+    analyser.smoothingTimeConstant = 0.85;
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
+  }
+
+  async function useMic() {
+    ensureAudio();
+    stopAudioBuffer();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    srcNode = actx.createMediaStreamSource(stream);
+    srcNode.connect(analyser);
+    started = true;
+  }
+
+  async function useFile(file) {
+    ensureAudio();
+    stopAudioBuffer();
+    const ab = await file.arrayBuffer();
+    const buf = await actx.decodeAudioData(ab);
+    audioBufferSource = actx.createBufferSource();
+    audioBufferSource.buffer = buf;
+    audioBufferSource.loop = true;
+    audioBufferSource.connect(analyser);
+    audioBufferSource.start();
+    started = true;
+  }
+
+  function stopAudioBuffer() {
+    if (audioBufferSource) { try { audioBufferSource.stop(); } catch(_){} audioBufferSource.disconnect(); audioBufferSource = null; }
+    if (srcNode) { try { srcNode.disconnect(); } catch(_){} srcNode = null; }
+  }
+
+  // --- UI wiring ---
+  $('#mic').onclick = () => useMic().catch(console.error);
+  $('#file').onclick = () => {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'audio/*';
+    inp.onchange = e => { if (inp.files && inp.files[0]) useFile(inp.files[0]); };
+    inp.click();
+  };
+  $('#pause').onclick = () => { playing = !playing; $('#pause').textContent = playing ? '⏸ Pause' : '▶️ Play'; };
+  addEventListener('keydown', (e) => {
+    if (e.key.toLowerCase() === 'm') $('#mic').click();
+    if (e.key.toLowerCase() === 'o') $('#file').click();
+    if (e.key === ' ') { e.preventDefault(); $('#pause').click(); }
+  });
+
+  // drag & drop
+  let dragCount = 0;
+  addEventListener('dragenter', (e) => { e.preventDefault(); dragCount++; drop.style.display='grid'; });
+  addEventListener('dragleave', (e) => { e.preventDefault(); dragCount=Math.max(0, dragCount-1); if(!dragCount) drop.style.display='none'; });
+  addEventListener('dragover', (e) => e.preventDefault());
+  addEventListener('drop', (e) => {
+    e.preventDefault(); dragCount=0; drop.style.display='none';
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) useFile(f);
+  });
+
+  // --- visuals ---
+  // A lightweight “glitch” pipeline:
+  // 1) base gradient flow
+  // 2) chromatic offset (RGB channels shifted by audio energy)
+  // 3) horizontal slice displacements (audio-gated)
+  // 4) scanlines overlay
+  const params = {
+    glitch: $('#glitch'),
+    intensity: $('#intensity'),
+    scan: $('#scan'),
+    fx: $('#fx')
+  };
+
+  let t0 = performance.now();
+  function draw(now) {
+    const dt = (now - t0) / 1000; t0 = now;
+    if (playing) {
+      // Base animated gradient
+      const time = now * 0.00025;
+      const g = ctx.createLinearGradient(0, 0, W, H);
+      g.addColorStop(0,   `hsl(${(time*120)%360} 80% 50%)`);
+      g.addColorStop(0.5, `hsl(${(time*120+120)%360} 80% 35%)`);
+      g.addColorStop(1,   `hsl(${(time*120+240)%360} 80% 15%)`);
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,W,H);
+
+      // If audio started, fetch spectrum
+      let energy = 0, bass = 0;
+      if (started && analyser) {
+        analyser.getByteFrequencyData(dataArray);
+        // overall energy
+        for (let i=0;i<dataArray.length;i++) energy += dataArray[i];
+        energy /= (dataArray.length*255);
+        // bass emphasis ~ first 1/10th
+        const bassBins = Math.max(8, (dataArray.length/10)|0);
+        for (let i=0;i<bassBins;i++) bass += dataArray[i];
+        bass /= (bassBins*255);
+      }
+
+      // Chromatic aberration (RGB offset by small deltas)
+      // Do it cheaply by copying canvas multiple times with globalCompositeOperation
+      const fx = +params.fx.value;               // 0..1
+      const shift = (2 + 10*fx) * (0.2 + energy); // pixels (in device px)
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.5;
+      // R
+      ctx.drawImage(canvas, shift, 0, W, H, 0, 0, W, H);
+      // G
+      ctx.drawImage(canvas, 0, shift, W, H, 0, 0, W, H);
+      // B
+      ctx.drawImage(canvas, -shift, 0, W, H, 0, 0, W, H);
+      ctx.globalAlpha = 1.0;
+      ctx.globalCompositeOperation = 'source-over';
+
+      // Horizontal slice “datamosh” style glitches
+      const gAmt = +params.glitch.value; // 0..1
+      const intensity = +params.intensity.value; // 0..1.25
+      const slices = Math.floor(2 + 24 * gAmt * (0.3 + energy));
+      for (let i=0;i<slices;i++) {
+        if (Math.random() > (0.3 + gAmt*0.7) * (0.25 + energy*0.75)) continue;
+        const h = Math.max(1, (Math.random()**2) * (H*0.08));
+        const y = Math.floor(Math.random() * (H - h));
+        const xShift = Math.floor((Math.random() * 2 - 1) * (W * 0.08 * intensity) * (0.2 + bass*1.6));
+        ctx.drawImage(canvas, 0, y, W, h, xShift, y, W, h);
+      }
+
+      // Scanlines
+      const scan = +params.scan.value; // 0..1
+      if (scan > 0) {
+        ctx.globalAlpha = 0.12 * scan;
+        for (let y=0; y<H; y+=2) { ctx.fillStyle = '#000'; ctx.fillRect(0,y,W,1); }
+        ctx.globalAlpha = 1.0;
+      }
+
+      // subtle vignette
+      ctx.fillStyle = 'rgba(0,0,0,0.08)';
+      ctx.fillRect(0,0,W,10);
+      ctx.fillRect(0,H-10,W,10);
+      ctx.fillRect(0,0,10,H);
+      ctx.fillRect(W-10,0,10,H);
+    }
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+
+  // Mobile/Autoplay safety: resume audio on first gesture
+  const resume = () => { if (actx && actx.state === 'suspended') actx.resume(); removeEventListener('pointerdown', resume); };
+  addEventListener('pointerdown', resume, { passive:true });
+})();
+</script>
+</body>
+</html>
