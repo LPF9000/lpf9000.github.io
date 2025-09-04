@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>glitch-network (iOS-safe)</title>
+<title>glitch-network (iOS fixed)</title>
 <style>
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
   canvas { display:block; width:100vw; height:100vh; touch-action:none; }
@@ -17,12 +17,10 @@
     appearance:none; background:#111; border:1px solid #59f; border-radius:8px;
     color:#59f; padding:10px 20px; font-size:16px; cursor:pointer;
   }
+  input[type="range"]{ width:120px; }
   #status { font-size:12px; color:#9af; opacity:.95 }
-  /* Show native controls only if needed */
+  /* Only show native controls if autoplay is blocked */
   #player { position:fixed; left:12px; bottom:12px; width:calc(100% - 24px); display:none; }
-  #drop { position:fixed; inset:0; display:none; place-items:center;
-    color:#9af; background:rgba(0,0,20,.7); border:2px dashed #59f;
-    font-family:sans-serif; font-size:18px; }
 </style>
 </head>
 <body>
@@ -30,19 +28,21 @@
 
 <div id="ui">
   <button id="fileBtn">🎵 Load / Play</button>
+  <label style="display:flex;align-items:center;gap:6px;">
+    Vol <input id="vol" type="range" min="0" max="1" step="0.01" value="1">
+  </label>
   <span id="status"></span>
 </div>
 
-<!-- Hidden audio element (made visible only if iOS insists on manual Play) -->
-<audio id="player" controls></audio>
-
-<div id="drop">Drop an audio file…</div>
+<!-- Hidden audio element (used as source; we mute it and route via WebAudio) -->
+<audio id="player" playsinline></audio>
 
 <script>
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const player = document.getElementById("player");
+const vol = document.getElementById("vol");
 
 let W,H,DPR=Math.max(1,Math.min(window.devicePixelRatio||1,2));
 function resize(){ W=canvas.width=innerWidth*DPR; H=canvas.height=innerHeight*DPR; }
@@ -50,52 +50,62 @@ addEventListener("resize",resize,{passive:true}); resize();
 
 function setStatus(msg){ statusEl.textContent = msg || ""; }
 
-// ---- iOS-safe audio: use <audio> element + MediaElementSource ----
-let actx, analyser, dataArray, srcNode, urlRef=null, started=false;
+// ---- iOS-safe audio path ----
+let actx, analyser, dataArray, srcNode, gainNode, urlRef=null, started=false;
 
-function ensureAudioContext(){
+function ensureAudio(){
   if (actx) return;
   const AC = window.AudioContext || window.webkitAudioContext;
   actx = new AC({ latencyHint: "interactive" });
+
   analyser = actx.createAnalyser();
   analyser.fftSize = 512;
   dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+  gainNode = actx.createGain();
+  gainNode.gain.value = +vol.value;
+  gainNode.connect(actx.destination);
+  vol.oninput = () => { if (gainNode) gainNode.gain.value = +vol.value; };
 }
 
 async function loadAndPlayFile(file){
-  // Revoke previous object URL if any
+  // revoke previous blob URL
   if (urlRef) { URL.revokeObjectURL(urlRef); urlRef = null; }
-  // Point the <audio> element to the chosen file
+
+  ensureAudio();
+  try { await actx.resume(); } catch(_) {}
+
+  // Use <audio> as the decoder/player
   urlRef = URL.createObjectURL(file);
   player.src = urlRef;
   player.loop = true;
 
-  ensureAudioContext();
-  // Create the MediaElementSource ONCE per audio element
+  // IMPORTANT: when we use MediaElementSource, the element doesn't go to speakers by itself.
+  // We mute the element and route via WebAudio to the destination.
+  player.muted = true;
+
   if (!srcNode) {
     srcNode = actx.createMediaElementSource(player);
-    // Route ONLY to analyser; the <audio> element handles actual playback
-    // (avoid double audio by not connecting to destination here)
+    // Visuals tap
     srcNode.connect(analyser);
+    // Audio out path
+    srcNode.connect(gainNode);   // <-- this is the missing link to speakers
   }
 
-  // Try to resume the context and play within the same gesture
-  try { await actx.resume(); } catch(e) { /* ignore */ }
-
   try {
-    await player.play();   // iOS-friendly: real element playback
+    await player.play();
     started = true;
     setStatus("");
-    // Hide controls when autoplay succeeded
+    // Hide native controls (we’re handling playback)
     player.style.display = "none";
   } catch (e) {
-    // If iOS blocks autoplay, show native controls so user can tap Play
+    // If iOS blocks this, show native controls so user can press Play once
     player.style.display = "block";
-    setStatus("Tap Play on the player to start audio.");
+    player.controls = true;
+    setStatus("Tap Play on the control bar to start audio.");
   }
 }
 
-// File picker button (mobile-first)
 document.getElementById("fileBtn").onclick = () => {
   const inp = document.createElement("input");
   inp.type = "file";
@@ -104,18 +114,7 @@ document.getElementById("fileBtn").onclick = () => {
   inp.click();
 };
 
-// Optional: desktop drag & drop
-const drop = document.getElementById("drop"); let dragCount=0;
-addEventListener("dragenter",e=>{e.preventDefault();dragCount++;drop.style.display="grid";});
-addEventListener("dragleave",e=>{e.preventDefault();dragCount=Math.max(0,dragCount-1);if(!dragCount)drop.style.display="none";});
-addEventListener("dragover",e=>e.preventDefault());
-addEventListener("drop",e=>{
-  e.preventDefault();dragCount=0;drop.style.display="none";
-  const f=e.dataTransfer.files && e.dataTransfer.files[0];
-  if (f) loadAndPlayFile(f);
-});
-
-// If user manually presses Play on the native controls, ensure context is running
+// If user presses Play on native controls, make sure context is running
 player.addEventListener("play", async () => {
   try { await actx.resume(); } catch(_) {}
   started = true; setStatus("");
@@ -135,7 +134,7 @@ function energy(){
   if(!started || !analyser) return 0;
   analyser.getByteFrequencyData(dataArray);
   let s=0; for (let v of dataArray) s+=v;
-  return s/(dataArray.length*255); // 0..1
+  return s/(dataArray.length*255);
 }
 
 function draw(){
@@ -145,7 +144,6 @@ function draw(){
   const e = energy();
   if (!started) setStatus("Tap ‘Load / Play’ and choose a file");
 
-  // Glitch bursts + occasional teleports
   for (let n of nodes){
     if (Math.random() < 0.02 + e*0.06) {
       n.vx += (Math.random()-0.5)*10*e;
@@ -162,7 +160,6 @@ function draw(){
     ctx.fill();
   }
 
-  // Edges / scaffolding
   ctx.lineWidth = 0.8 + e*2.2;
   for (let i=0;i<N;i++){
     for (let j=i+1;j<N;j++){
