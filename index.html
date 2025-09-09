@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-<title>glitch-mesh — psychedelic</title>
+<title>glitch-mesh — psychedelic + MIDI</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
@@ -13,11 +13,11 @@
   #ui {
     position:fixed;
     left:50%;
-    bottom:58px;                   /* sits above the toggle pill */
-    transform:translate(-50%, 12px); /* slightly below (hidden-ish) when closed */
+    bottom:58px;
+    transform:translate(-50%, 12px);
     width:min(1200px, 100vw - 20px);
-    max-height:65vh;               /* drawer height cap */
-    overflow-y:auto;               /* scroll inside */
+    max-height:65vh;
+    overflow-y:auto;
     display:flex; gap:10px; flex-wrap:wrap; align-items:center;
     background:rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.25);
     border-radius:14px; padding:10px 12px; font:14px system-ui, sans-serif; color:#fff;
@@ -33,11 +33,13 @@
   .g label { font-size:12px; opacity:.85 }
   .g input[type="range"] { width:140px; }
   .g input[type="checkbox"] { width:18px; height:18px; }
+  select { background:#111; color:#fff; border:1px solid rgba(255,255,255,.25); border-radius:8px; padding:6px 8px; }
   button {
     appearance:none; background:#111; color:#7fb0ff; border:1px solid #7fb0ff;
     padding:9px 14px; border-radius:9px; font:14px system-ui,sans-serif; cursor:pointer;
   }
   #fps { font-size:12px; color:#9ad; opacity:.85; margin-left:4px }
+  #midiStatus { font-size:12px; color:#9f9; opacity:.9; min-width:180px }
 
   /* Bottom toggle pill */
   #uiToggleWrap {
@@ -84,6 +86,12 @@
   <div class="g"><label>Layers</label><input id="psyLayers" type="range" min="1" max="8" step="1" value="4"></div>
   <div class="g"><label>Field Flow</label><input id="psyFlow" type="range" min="0" max="2" step="0.01" value="0.5"></div>
 
+  <!-- MIDI -->
+  <div class="g"><label>MIDI</label><button id="midiEnable" type="button">🎹 Enable MIDI</button></div>
+  <div class="g"><label>Input</label><select id="midiIn"></select></div>
+  <div class="g"><label>Channel</label><select id="midiChan"></select></div>
+  <span id="midiStatus"></span>
+
   <!-- Actions -->
   <button id="random"  type="button">🎲 Randomize</button>
   <button id="pause"   type="button">⏸ Pause</button>
@@ -120,7 +128,7 @@
   const toggle = $('#uiToggle');
   function syncDrawer(){ panel.classList.toggle('open', toggle.checked); }
   toggle.addEventListener('change', syncDrawer);
-  syncDrawer(); // initialize
+  syncDrawer();
 
   // Sliders
   const UI = {
@@ -144,6 +152,27 @@
     psyFlow: $('#psyFlow')
   };
 
+  // MIDI UI
+  const midiEnableBtn = $('#midiEnable');
+  const midiInSel = $('#midiIn');
+  const midiChanSel = $('#midiChan');
+  const midiStatusEl = $('#midiStatus');
+  const pauseBtn = $('#pause');
+
+  // Populate channel select (All + 1..16)
+  (function initChanSel(){
+    midiChanSel.innerHTML = '';
+    const optAll = document.createElement('option');
+    optAll.value = '0'; optAll.textContent = 'All';
+    midiChanSel.appendChild(optAll);
+    for (let ch=1; ch<=16; ch++){
+      const o = document.createElement('option');
+      o.value = String(ch); o.textContent = `Ch ${ch}`;
+      midiChanSel.appendChild(o);
+    }
+    midiChanSel.value = '0';
+  })();
+
   // State
   let nodes = [];
   let playing = true;
@@ -164,6 +193,8 @@
   const rnd  = (a=1)=> Math.random()*a;
   const rndN = (n=1)=> (Math.random()*2-1)*n;
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const map = (v, inMin, inMax, outMin, outMax) => outMin + (outMax-outMin) * ((v-inMin)/(inMax-inMin));
+  const setSlider = (el, val, toFixed=null) => { const v = clamp(val, +el.min, +el.max); el.value = toFixed==null ? v : v.toFixed(toFixed); };
 
   // Sacred-geometry-ish field
   function fieldValue(x, y, t, sym, freq, layers){
@@ -219,12 +250,12 @@
       const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
       const span = max - min;
 
-      if (id === 'trail') { // 50–95%
+      if (id === 'trail') {
         const val = min + 0.50*span + Math.random()*(0.45*span);
         inp.value = (+val).toFixed(2);
         continue;
       }
-      if (id === 'radius') { // 0–50%
+      if (id === 'radius') {
         const val = min + Math.random()*(0.50*span);
         inp.value = Math.round(val / step) * step;
         continue;
@@ -249,7 +280,7 @@
   // Bind UI
   $('#random').addEventListener('click', randomizeAll);
   $('#pause').addEventListener('click', () => {
-    playing=!playing; $('#pause').textContent = playing ? '⏸ Pause' : '▶️ Play';
+    playing=!playing; pauseBtn.textContent = playing ? '⏸ Pause' : '▶️ Play';
   });
   UI.nodes.addEventListener('input', applyFromSliders);
   UI.warp.addEventListener('input', applyFromSliders);
@@ -407,6 +438,234 @@
       n.vy = Math.sin(ang)*speed;
     }
   }, 250);
+
+  // ===============================
+  //        WEB MIDI INTEGRATION
+  // ===============================
+  let midiAccess = null;
+  let currentInput = null;
+  let midiChannel = 0;  // 0 = omni, 1..16 = specific channel
+  let clockCount = 0, clockWindowStart = 0;
+
+  function setMidiStatus(msg, ok=true){
+    midiStatusEl.textContent = msg;
+    midiStatusEl.style.color = ok ? '#9f9' : '#f99';
+  }
+
+  function enableMIDI(){
+    if (!('requestMIDIAccess' in navigator)){
+      setMidiStatus('Web MIDI not supported. Use Chrome/Edge.', false);
+      return;
+    }
+    navigator.requestMIDIAccess().then(access => {
+      midiAccess = access;
+      setMidiStatus('MIDI ready.');
+      midiAccess.onstatechange = updateMidiInputs;
+      updateMidiInputs();
+    }, err => {
+      setMidiStatus('MIDI access denied.', false);
+      console.error(err);
+    });
+  }
+
+  function updateMidiInputs(){
+    if (!midiAccess) return;
+    const prev = midiInSel.value;
+    midiInSel.innerHTML = '';
+    let firstId = null;
+    for (const input of midiAccess.inputs.values()){
+      if (!firstId) firstId = input.id;
+      const opt = document.createElement('option');
+      opt.value = input.id; opt.textContent = input.name || input.manufacturer || input.id;
+      midiInSel.appendChild(opt);
+    }
+    if (!firstId){
+      const opt = document.createElement('option');
+      opt.value = ''; opt.textContent = 'No inputs';
+      midiInSel.appendChild(opt);
+      setMidiInput(null);
+      setMidiStatus('No MIDI inputs found.', false);
+    } else {
+      const id = (prev && midiAccess.inputs.get(prev)) ? prev : firstId;
+      midiInSel.value = id;
+      setMidiInput(id);
+      setMidiStatus('Listening: ' + midiAccess.inputs.get(id).name);
+    }
+  }
+
+  function setMidiInput(id){
+    if (currentInput) { currentInput.onmidimessage = null; currentInput = null; }
+    if (!id || !midiAccess) return;
+    currentInput = midiAccess.inputs.get(id);
+    if (currentInput){
+      currentInput.onmidimessage = handleMIDIMessage;
+    }
+  }
+
+  midiEnableBtn.addEventListener('click', enableMIDI);
+  midiInSel.addEventListener('change', e => setMidiInput(e.target.value));
+  midiChanSel.addEventListener('change', e => { midiChannel = parseInt(e.target.value,10) || 0; });
+
+  function handleMIDIMessage(e){
+    const d = e.data;
+    if (!d || d.length === 0) return;
+    const status = d[0];
+
+    // Realtime messages (no channel)
+    if (status >= 0xF8){
+      switch(status){
+        case 0xF8: onClock(e.timeStamp); break;      // Timing clock
+        case 0xFA: onStart(); break;                 // Start
+        case 0xFC: onStop(); break;                  // Stop
+      }
+      return;
+    }
+
+    const type = status & 0xF0;
+    const chan = (status & 0x0F) + 1;
+    if (midiChannel && chan !== midiChannel) return;
+
+    const data1 = d[1] || 0;
+    const data2 = d[2] || 0;
+
+    switch(type){
+      case 0x90: // Note On
+        if (data2 > 0) onNoteOn(data1, data2, chan); else onNoteOff(data1, chan);
+        break;
+      case 0x80: // Note Off
+        onNoteOff(data1, chan);
+        break;
+      case 0xB0: // CC
+        onCC(data1, data2, chan);
+        break;
+      case 0xE0: { // Pitch bend (14-bit)
+        const value14 = (data2 << 7) | data1; // 0..16383
+        onPitchBend(value14, chan);
+        break;
+      }
+      case 0xD0: // Channel pressure (aftertouch)
+        onAftertouch(data1, chan);
+        break;
+      case 0xC0: // Program change
+        onProgramChange(data1, chan);
+        break;
+      default:
+        break;
+    }
+  }
+
+  // ====== MIDI handlers / mappings ======
+
+  function onNoteOn(note, velocity, ch){
+    // Impulse center from note via golden-angle placement
+    const angle = (note * (Math.PI * 2 * 0.38196601125)) % (Math.PI*2); // ~golden
+    const ring = (note % 16) / 16; // 0..~1
+    const radius = (0.15 + 0.55 * ring) * Math.min(W,H) * 0.5; // inward bias
+    const cx = W/2 + Math.cos(angle) * radius;
+    const cy = H/2 + Math.sin(angle) * radius;
+
+    const strength = (velocity/127) * 18; // overall kick
+    for (const n of nodes){
+      const dx = n.x - cx, dy = n.y - cy;
+      const d = Math.hypot(dx,dy) + 40;
+      const f = strength / d;   // distance falloff
+      n.vx += (dx/d) * f;
+      n.vy += (dy/d) * f;
+    }
+
+    // Palette nudge
+    hueBase = (hueBase + note*0.5) % 360;
+    edgeBase = (edgeBase + note*0.25) % 360;
+  }
+
+  function onNoteOff(note, ch){
+    // (noop by default)
+  }
+
+  function onCC(cc, val, ch){
+    switch(cc){
+      case 1: // Mod wheel -> Fibo Hue Speed (0..2)
+        setSlider(UI.fiboSpeed, map(val,0,127,0,2), 3);
+        break;
+      case 74: // Brightness -> Trail (bias toward bright 0.5..0.95)
+        setSlider(UI.trail, map(val,0,127,0.50,0.95), 2);
+        break;
+      case 71: // Resonance -> Feedback mix
+        setSlider(UI.feedback, map(val,0,127,0,1), 2);
+        break;
+      case 73: // Attack -> Feedback warp
+        setSlider(UI.fbWarp, map(val,0,127,0,1), 2);
+        break;
+      case 10: { // Pan -> Symmetry (2..16)
+        const sym = Math.round(map(val,0,127,2,16));
+        setSlider(UI.psySym, sym);
+        break;
+      }
+      case 11: // Expression -> Psy Influence (0..1.5)
+        setSlider(UI.psyInf, map(val,0,127,0,1.5), 2);
+        break;
+      case 7: { // Volume -> Link Radius (0..50% of range)
+        const minR = +UI.radius.min, maxR = +UI.radius.max;
+        const v = minR + (maxR-minR)*0.5 * (val/127);
+        setSlider(UI.radius, v);
+        break;
+      }
+      case 2: // Breath -> Glitch (0..1.5)
+        setSlider(UI.glitch, map(val,0,127,0,1.5), 2);
+        break;
+      case 21: // -> Time Warp
+        setSlider(UI.warp, map(val,0,127,0.1,3), 2); applyFromSliders();
+        break;
+      case 22: // -> Edge Thickness
+        setSlider(UI.thick, map(val,0,127,0.4,4), 1);
+        break;
+      case 23: // -> Teleport
+        setSlider(UI.tele, map(val,0,127,0,0.05), 3);
+        break;
+      case 64: // Sustain pedal: down=pause, up=play
+        if (val >= 64) { playing=false; pauseBtn.textContent='▶️ Play'; }
+        else { playing=true; pauseBtn.textContent='⏸ Pause'; }
+        break;
+      default:
+        // Unmapped CCs ignored
+        break;
+    }
+  }
+
+  function onPitchBend(value14, ch){
+    // value14: 0..16383, center 8192
+    const norm = (value14 - 8192) / 8192; // -1..+1
+    const warp = clamp(1 + norm*1.5, 0.1, 3);
+    setSlider(UI.warp, warp, 2);
+    applyFromSliders();
+  }
+
+  function onAftertouch(pressure, ch){
+    setSlider(UI.feedback, pressure/127, 2);
+  }
+
+  function onProgramChange(program, ch){
+    // Randomize scene
+    randomizeAll();
+  }
+
+  function onClock(ts){
+    // 24 clocks per quarter note
+    if (clockCount === 0) clockWindowStart = ts;
+    clockCount++;
+    if (clockCount >= 24){
+      const elapsedMs = ts - clockWindowStart; // one beat
+      const bpm = 60000 / Math.max(1, elapsedMs);
+      // Map BPM to fibo speed (0..2). 0..240 BPM -> 0..2
+      const fibo = clamp(bpm / 120, 0, 2);
+      setSlider(UI.fiboSpeed, fibo, 3);
+      clockCount = 0;
+      clockWindowStart = ts;
+    }
+  }
+
+  function onStart(){ playing = true; pauseBtn.textContent='⏸ Pause'; }
+  function onStop(){ playing = false; pauseBtn.textContent='▶️ Play'; }
 })();
 </script>
 </body>
