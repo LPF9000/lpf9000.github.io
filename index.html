@@ -3,31 +3,24 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-<title>glitch-mesh — optimized + MIDI Learn + HiDPI/Supersample</title>
+<title>glitch-mesh — fast + MIDI Learn + HiDPI/Supersample</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
   canvas { display:block; width:100vw; height:100vh; touch-action:none; }
 
-  /* Bottom drawer: slides up, scrolls internally if tall */
+  /* Bottom drawer */
   #ui {
-    position:fixed;
-    left:50%;
-    bottom:58px;
-    transform:translate(-50%, 12px);
-    width:min(1200px, 100vw - 20px);
-    max-height:65vh;
-    overflow-y:auto;
+    position:fixed; left:50%; bottom:58px; transform:translate(-50%, 12px);
+    width:min(1200px, 100vw - 20px); max-height:65vh; overflow-y:auto;
     display:flex; gap:10px; flex-wrap:wrap; align-items:center;
     background:rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.25);
     border-radius:14px; padding:10px 12px; font:14px system-ui, sans-serif; color:#fff;
     box-shadow:0 8px 30px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.06) inset;
-    z-index:10;
-    transition: transform .25s ease, opacity .25s ease;
-    opacity:.0; pointer-events:none;
-    -webkit-overflow-scrolling: touch;
+    z-index:10; transition: transform .25s ease, opacity .25s ease;
+    opacity:.0; pointer-events:none; -webkit-overflow-scrolling: touch;
   }
-  #ui.open { transform:translate(-50%, 0); opacity:1; pointer-events:auto; }
+  #ui.open { transform:translate(-50%,0); opacity:1; pointer-events:auto; }
 
   .g { display:flex; flex-direction:column; gap:2px; }
   .g label { font-size:12px; opacity:.85 }
@@ -44,14 +37,13 @@
   #fps, #res { font-size:12px; color:#9ad; opacity:.85; margin-left:4px }
   #midiStatus { font-size:12px; color:#9f9; opacity:.9; min-width:200px }
   .midi-badge {
-    display:inline-block; margin-top:2px; width:max-content;
-    font-size:11px; color:#bfe1ff;
+    display:inline-block; margin-top:2px; width:max-content; font-size:11px; color:#bfe1ff;
     background:rgba(127,176,255,.12); border:1px solid rgba(127,176,255,.3);
     border-radius:999px; padding:2px 6px;
   }
-
   .learn-target { outline:2px solid #7fb0ff; border-radius:12px; box-shadow:0 0 0 4px rgba(127,176,255,.22); }
 
+  /* Bottom toggle pill */
   #uiToggleWrap {
     position:fixed; left:50%; bottom:10px; transform:translateX(-50%);
     background:rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.25);
@@ -69,11 +61,11 @@
 <div id="ui">
   <!-- Structure -->
   <div class="g"><label>Nodes</label><input id="nodes" type="range" min="40" max="500" step="10" value="160"><span class="midi-badge" hidden></span></div>
-
-  <!-- ↓↓↓ Link Radius max reduced to 80% (500 → 400) ↓↓↓ -->
+  <!-- Link Radius max reduced to 80% (500 → 400) -->
   <div class="g"><label>Link Radius</label><input id="radius" type="range" min="40" max="400" step="5" value="180"><span class="midi-badge" hidden></span></div>
-
   <div class="g"><label>Edge Thicc</label><input id="thick" type="range" min="0.4" max="4" step="0.1" value="1.2"><span class="midi-badge" hidden></span></div>
+  <!-- NEW: Edge Budget (avg neighbors per node) -->
+  <div class="g"><label>Edge Budget</label><input id="edgeBudget" type="range" min="4" max="48" step="1" value="16"></div>
 
   <!-- Motion/feel -->
   <div class="g"><label>Glitch (jitter)</label><input id="glitch" type="range" min="0" max="1.5" step="0.01" value="0.65"><span class="midi-badge" hidden></span></div>
@@ -164,6 +156,7 @@
   // Sliders / toggles
   const UI = {
     nodes: $('#nodes'), radius: $('#radius'),
+    edgeBudget: $('#edgeBudget'),
     trail: $('#trail'), trailCurve: $('#trailCurve'),
     feedback: $('#feedback'), fbCurve: $('#fbCurve'), fbWarp: $('#fbWarp'),
     glitch: $('#glitch'), tele:  $('#tele'), thick: $('#thick'),
@@ -209,7 +202,6 @@
     const eff = (dpr * RENDER_SCALE).toFixed(2);
     UI.res.textContent = `Res ${eff}×  •  ${W}×${H}px`;
   }
-
   function applyDisplaySettings(){
     RENDER_SCALE = parseFloat(UI.renderScale.value) || 1;
     USE_HIDPI = !!UI.hidpi.checked;
@@ -263,11 +255,11 @@
     timeScale = +UI.warp.value;
   }
 
-  // Randomize with constraints; EXCLUDE display controls
+  // Randomize with constraints; EXCLUDE display + edge budget
   function randomizeAll(){
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const id = inp.id;
-      if (id === 'renderScale') continue; // do not randomize display
+      if (id === 'renderScale' || id === 'edgeBudget') continue;
 
       const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
       const span = max - min;
@@ -318,119 +310,115 @@
   resize();
   makeNodes(+UI.nodes.value);
 
-  // === OPTIMIZED EDGES: helpers ===
-  const BUCKET_DEG = 24;              // hue bucket width (deg)
-  const ALPHA_BUCKETS = 5;            // alpha quantization levels
-  const HUE_BUCKETS = Math.floor(360/BUCKET_DEG);
-  function pairHash(i,j){             // stable 0..1 hash for a pair (no allocations)
-    const x = ((i*73856093) ^ (j*19349663)) >>> 0;
-    return x / 4294967295;
+  // ---------- Performance: persistent spatial grid (typed arrays) ----------
+  let gridCell = 64, gridCols = 0, gridRows = 0, heads = null, next = null;
+  function ensureGrid(cell){
+    const cols = Math.floor(W / cell) + 1;
+    const rows = Math.floor(H / cell) + 1;
+    if (!heads || cols!==gridCols || rows!==gridRows){
+      gridCols = cols; gridRows = rows; gridCell = cell;
+      heads = new Int32Array(cols*rows);
+    }
+    if (!next || next.length !== nodes.length){
+      next = new Int32Array(nodes.length);
+    }
+    heads.fill(-1);
   }
 
-  // === OPTIMIZED EDGES: main drawing using spatial grid + bucketed strokes ===
-  function drawEdgesOptimized(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ){
+  function binIndex(x,y){
+    const cx = x < 0 ? 0 : (x >= W ? (W-1) : x) / gridCell | 0;
+    const cy = y < 0 ? 0 : (y >= H ? (H-1) : y) / gridCell | 0;
+    return cy*gridCols + cx;
+  }
+
+  // stable pair hash -> 0..1
+  function pairHash(i,j){
+    const a = (i+1)*73856093 ^ (j+1)*19349663;
+    return (a >>> 0) / 4294967295;
+  }
+
+  // ---------- Optimized edge drawing (sampling + no sqrt in hot loop) ----------
+  function drawEdgesFast(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ){
     const reach0 = linkR * 0.6, reach1 = linkR;
     const reach02 = reach0*reach0, reach12 = reach1*reach1;
 
-    // 1) Build spatial grid (cell ≈ linkR so neighbors are in 3×3 cells)
-    const cell = Math.max(8, linkR|0);
-    const cols = Math.floor(W / cell) + 1;
-    const rows = Math.floor(H / cell) + 1;
-    const bins = new Array(cols*rows);
-    for (let i=0;i<bins.length;i++) bins[i] = [];
+    // Build grid
+    const cell = Math.max(12, linkR|0);
+    ensureGrid(cell);
     for (let i=0;i<nodes.length;i++){
       const n = nodes[i];
-      const cx = (n.x / cell)|0, cy = (n.y / cell)|0;
-      const idx = cy*cols + cx;
-      if (bins[idx]) bins[idx].push(i);
+      const idx = binIndex(n.x, n.y);
+      next[i] = heads[idx];
+      heads[idx] = i;
     }
 
-    // 2) Pre-create bucketed Path2D containers
-    const paths = [[],[]], counts = [[],[]];
-    for (let p=0;p<2;p++){
-      paths[p] = Array.from({length:HUE_BUCKETS}, () => Array.from({length:ALPHA_BUCKETS}, () => new Path2D()));
-      counts[p] = Array.from({length:HUE_BUCKETS}, () => Array(ALPHA_BUCKETS).fill(0));
-    }
+    // Sampling probability to meet Edge Budget
+    const N = nodes.length;
+    const density = N / (W*H + 1e-6);
+    const k_est = Math.PI * reach12 * density;        // expected neighbors per node (uniform)
+    const targetK = +UI.edgeBudget.value;
+    const baseP = clamp(targetK / (k_est + 1e-6), 0.0, 1.0);
 
-    // 3) Visit neighbors and push segments into buckets
-    for (let i=0;i<nodes.length;i++){
+    ctx.lineCap = 'round';
+
+    for (let i=0;i<N;i++){
       const a = nodes[i];
-      const acx=(a.x/cell)|0, acy=(a.y/cell)|0;
+      const acx = (a.x / cell) | 0, acy = (a.y / cell) | 0;
+
       for (let ny=acy-1; ny<=acy+1; ny++){
-        if (ny<0 || ny>=rows) continue;
+        if (ny<0 || ny>=gridRows) continue;
         for (let nx=acx-1; nx<=acx+1; nx++){
-          if (nx<0 || nx>=cols) continue;
-          const bin = bins[ny*cols + nx];
-          if (!bin) continue;
-          for (let k=0;k<bin.length;k++){
-            const j = bin[k];
-            if (j<=i) continue; // dedup
+          if (nx<0 || nx>=gridCols) continue;
+          for (let j = heads[ny*gridCols + nx]; j !== -1; j = next[j]){
+            if (j <= i) continue; // de-dup
 
             const b = nodes[j];
             const dx = a.x - b.x, dy = a.y - b.y;
             const d2 = dx*dx + dy*dy;
-            if (d2 >= reach12) continue; // too far for both passes
+            if (d2 >= reach12) continue;
 
-            const d = Math.sqrt(d2);
-            const baseHue = (edgeBase + edgePhaseQ + pairHash(i,j)*360) % 360;
-            const hueBucket = ((baseHue/BUCKET_DEG)|0) % HUE_BUCKETS;
+            // Distance-based fade without sqrt
+            const fade1 = 1 - (d2 / reach12); if (fade1 <= 0) continue;
+            // Bias sampling toward closer edges so structure holds
+            const p = baseP * (0.35 + 0.65 * fade1);
+            if (Math.random() > p) continue;
 
-            // mid-segment (will add small warp/jitter)
-            let mx = (a.x+b.x)/2, my=(a.y+b.y)/2;
+            // Color from pair hash + stepped phase
+            const ehue = (edgeBase + edgePhaseQ + pairHash(i,j)*360) % 360;
 
-            // pass 0 (thinner/shorter reach)
+            // Midpoint jitter + optional field warp on thick pass
+            let mx = (a.x+b.x)*0.5, my = (a.y+b.y)*0.5;
+            let jx1 = rndN(6 + 22*fade1), jy1 = rndN(6 + 22*fade1);
+
+            // THIN PASS (shorter reach, lower alpha)
             if (d2 < reach02){
-              const fade0 = 1 - d/reach0;
-              let jx = rndN(6 + 22*fade0), jy = rndN(6 + 22*fade0);
-              const pth = paths[0][hueBucket];
-              const alpha0 = clamp(0.06 + 0.25*fade0, 0, 0.55);
-              const aIdx0 = Math.min(ALPHA_BUCKETS-1, (alpha0/0.55*ALPHA_BUCKETS)|0);
-              const path0 = pth[aIdx0];
-              path0.moveTo(a.x, a.y);
-              path0.lineTo(mx + jx, my + jy);
-              path0.lineTo(b.x, b.y);
-              counts[0][hueBucket][aIdx0]++;
+              const fade0 = 1 - (d2 / reach02);
+              const a0 = clamp(0.06 + 0.25*fade0, 0, 0.55);
+              ctx.lineWidth = thick * 0.5;
+              ctx.strokeStyle = `hsla(${ehue},95%,55%,${a0})`;
+              ctx.beginPath();
+              ctx.moveTo(a.x, a.y);
+              ctx.lineTo(mx + jx1, my + jy1);
+              ctx.lineTo(b.x, b.y);
+              ctx.stroke();
             }
 
-            // pass 1 (thicker/full reach)
-            if (d2 < reach12){
-              const fade1 = 1 - d/reach1;
-              let jx = rndN(6 + 22*fade1), jy = rndN(6 + 22*fade1);
-              if (psyON && psyInf>0){
-                // compute sacred-field warp ONLY on thick pass (perf-friendly)
-                const Fm = fieldValue(mx,my,tField,psySym,psyFreq,psyLayers);
-                const w = Math.sin(Fm*1.5+now*0.001)*8;
-                jx += w; jy -= w;
-              }
-              const pth = paths[1][hueBucket];
-              const alpha1 = clamp(0.12 + 0.35*fade1, 0, 0.55);
-              const aIdx1 = Math.min(ALPHA_BUCKETS-1, (alpha1/0.55*ALPHA_BUCKETS)|0);
-              const path1 = pth[aIdx1];
-              path1.moveTo(a.x, a.y);
-              path1.lineTo(mx + jx, my + jy);
-              path1.lineTo(b.x, b.y);
-              counts[1][hueBucket][aIdx1]++;
+            // THICK PASS (full reach, field warp)
+            let jx = jx1, jy = jy1;
+            if (psyON && psyInf>0){
+              const Fm = fieldValue(mx,my,tField,psySym,psyFreq,psyLayers);
+              const w = Math.sin(Fm*1.5+now*0.001)*8;
+              jx += w; jy -= w;
             }
+            const a1 = clamp(0.12 + 0.35*fade1, 0, 0.55);
+            ctx.lineWidth = thick;
+            ctx.strokeStyle = `hsla(${ehue},95%,55%,${a1})`;
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(mx + jx, my + jy);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
           }
-        }
-      }
-    }
-
-    // 4) Stroke buckets (few strokes total)
-    ctx.lineCap = 'round';
-    for (let pass=0; pass<2; pass++){
-      ctx.lineWidth = thick*(pass?1:0.5);
-      for (let hb=0; hb<HUE_BUCKETS; hb++){
-        const bucketHue = (edgeBase + edgePhaseQ + hb*BUCKET_DEG + BUCKET_DEG*0.5) % 360;
-        ctx.strokeStyle = `hsl(${bucketHue},95%,55%)`;
-        const arr = paths[pass][hb];
-        for (let ab=0; ab<ALPHA_BUCKETS; ab++){
-          if (!counts[pass][hb][ab]) continue;
-          const repAlpha = ((ab+0.5)/ALPHA_BUCKETS) * 0.55;
-          ctx.save();
-          ctx.globalAlpha = repAlpha;
-          ctx.stroke(arr[ab]);
-          ctx.restore();
         }
       }
     }
@@ -524,8 +512,8 @@
         ctx.fill();
       }
 
-      // === OPTIMIZED EDGES call (replaces old O(N^2) loop) ===
-      drawEdgesOptimized(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ);
+      // Fast edges
+      drawEdgesFast(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ);
 
       // Snapshot for feedback
       fbc.clearRect(0,0,W,H);
@@ -685,6 +673,7 @@
     const el = document.getElementById(b.targetId); if (!el) return;
     let norm = 0;
     switch(msg.type){
+      case 0x0: break;
       case 'cc':  norm = msg.value / 127; break;
       case 'at':  norm = msg.value / 127; break;
       case 'note': norm = msg.vel / 127; break;
@@ -724,6 +713,7 @@
   // Initial motion + load mappings
   setTimeout(() => { hueBase = Math.random()*360; edgeBase = Math.random()*360; for (const n of nodes){ const s=1.5+Math.random()*3.0; const a=Math.random()*Math.PI*2; n.vx=Math.cos(a)*s; n.vy=Math.sin(a)*s; }}, 250);
   (function loadBindings(){ try{ const raw = localStorage.getItem('glitchMeshMidiBindings_v1'); if (!raw) return; const arr=JSON.parse(raw); if (Array.isArray(arr)){ bindings=arr; for (const b of bindings){ const el=document.getElementById(b.targetId); if (el) { const lbl=(b.type==='cc'?`CC${b.controller}`:b.type==='pb'?'PitchBend':b.type==='at'?'Aftertouch':`Note${b.note}`)+` ch${b.channel}`; const badge=el.parentElement.querySelector('.midi-badge'); if (badge){ badge.textContent='🔗 '+lbl; badge.hidden=false; } } } } }catch(e){} })();
+
 })();
 </script>
 </body>
