@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-<title>glitch-mesh — psychedelic + MIDI Learn</title>
+<title>glitch-mesh — psychedelic + MIDI Learn + HiDPI/Supersample</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
@@ -34,16 +34,14 @@
   .g input[type="range"] { width:140px; }
   .g input[type="checkbox"] { width:18px; height:18px; }
 
+  select { background:#111; color:#fff; border:1px solid rgba(255,255,255,.25); border-radius:8px; padding:6px 8px; }
   button {
     appearance:none; background:#111; color:#7fb0ff; border:1px solid #7fb0ff;
     padding:9px 14px; border-radius:9px; font:14px system-ui,sans-serif; cursor:pointer;
   }
   button.active { color:#f0baff; border-color:#f0baff; box-shadow:0 0 0 2px rgba(240,186,255,.2) inset; }
 
-  #fps { font-size:12px; color:#9ad; opacity:.85; margin-left:4px }
-
-  /* MIDI UI bits */
-  select { background:#111; color:#fff; border:1px solid rgba(255,255,255,.25); border-radius:8px; padding:6px 8px; }
+  #fps, #res { font-size:12px; color:#9ad; opacity:.85; margin-left:4px }
   #midiStatus { font-size:12px; color:#9f9; opacity:.9; min-width:200px }
   .midi-badge {
     display:inline-block; margin-top:2px; width:max-content;
@@ -52,7 +50,7 @@
     border-radius:999px; padding:2px 6px;
   }
 
-  /* Learn highlight on the selected slider */
+  /* Learn highlight */
   .learn-target {
     outline:2px solid #7fb0ff; border-radius:12px;
     box-shadow:0 0 0 4px rgba(127,176,255,.22);
@@ -103,6 +101,11 @@
   <div class="g"><label>Layers</label><input id="psyLayers" type="range" min="1" max="8" step="1" value="4"><span class="midi-badge" hidden></span></div>
   <div class="g"><label>Field Flow</label><input id="psyFlow" type="range" min="0" max="2" step="0.01" value="0.5"><span class="midi-badge" hidden></span></div>
 
+  <!-- Display / Resolution -->
+  <div class="g"><label>Render Scale</label><input id="renderScale" type="range" min="1" max="2" step="0.05" value="1.00"></div>
+  <div class="g"><label>HiDPI</label><input id="hidpi" type="checkbox"></div>
+  <div class="g"><label>HiDPI Max 3×</label><input id="hidpi3" type="checkbox"></div>
+
   <!-- MIDI -->
   <div class="g"><label>MIDI</label><button id="midiEnable" type="button">🎹 Enable MIDI</button></div>
   <div class="g"><label>Learn</label><button id="midiLearn" type="button">🎯 Learn: Off</button></div>
@@ -110,10 +113,11 @@
   <div class="g"><label>All</label><button id="midiClearAll" type="button">🗑 Clear All</button></div>
   <span id="midiStatus">MIDI: idle</span>
 
-  <!-- Actions -->
+  <!-- Actions / readouts -->
   <button id="random"  type="button">🎲 Randomize</button>
   <button id="pause"   type="button">⏸ Pause</button>
   <span id="fps"></span>
+  <span id="res"></span>
 </div>
 
 <!-- Bottom toggle pill -->
@@ -132,14 +136,26 @@
   const fb = document.createElement('canvas');
   const fbc = fb.getContext('2d');
 
-  let DPR = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
   let W=0, H=0;
-  function resize(){
-    W = cv.width = Math.floor(innerWidth * DPR);
-    H = cv.height = Math.floor(innerHeight * DPR);
-    fb.width = W; fb.height = H;
+
+  // --- Display / scale state ---
+  let USE_HIDPI = false;     // OFF by default
+  let HIDPI_MAX3 = false;    // OFF by default (cap DPR at 2 unless this is on)
+  let RENDER_SCALE = 1.00;   // 1.00 by default
+
+  function effectiveScale(){
+    const dpr = USE_HIDPI ? Math.min(window.devicePixelRatio || 1, HIDPI_MAX3 ? 3 : 2) : 1;
+    return dpr * RENDER_SCALE;
   }
-  addEventListener('resize', resize, {passive:true}); resize();
+
+  function resize(){
+    const scale = effectiveScale();
+    W = cv.width  = Math.floor(innerWidth  * scale);
+    H = cv.height = Math.floor(innerHeight * scale);
+    fb.width = W; fb.height = H;
+    updateResReadout();
+  }
+  addEventListener('resize', resize, {passive:true});
 
   // Drawer open/close
   const panel = $('#ui');
@@ -148,14 +164,21 @@
   toggle.addEventListener('change', syncDrawer);
   syncDrawer();
 
-  // Sliders
+  // Sliders / toggles
   const UI = {
-    nodes: $('#nodes'), radius: $('#radius'), trail: $('#trail'), trailCurve: $('#trailCurve'),
+    nodes: $('#nodes'), radius: $('#radius'),
+    trail: $('#trail'), trailCurve: $('#trailCurve'),
     feedback: $('#feedback'), fbCurve: $('#fbCurve'), fbWarp: $('#fbWarp'),
     glitch: $('#glitch'), tele:  $('#tele'), thick: $('#thick'),
     warp:  $('#warp'), fiboSpeed: $('#fiboSpeed'),
     psyOn: $('#psyOn'), psyInf: $('#psyInf'), psySym: $('#psySym'),
-    psyFreq: $('#psyFreq'), psyLayers: $('#psyLayers'), psyFlow: $('#psyFlow')
+    psyFreq: $('#psyFreq'), psyLayers: $('#psyLayers'), psyFlow: $('#psyFlow'),
+
+    // Display controls
+    renderScale: $('#renderScale'),
+    hidpi: $('#hidpi'),
+    hidpi3: $('#hidpi3'),
+    res: $('#res')
   };
 
   // State
@@ -186,7 +209,20 @@
     if (step>0) v = Math.round(v/step)*step;
     const dec = decimalsOfStep(el);
     el.value = dec? v.toFixed(dec) : String(v);
-    el.dispatchEvent(new Event('input', {bubbles:true})); // ensure listeners run
+    el.dispatchEvent(new Event('input', {bubbles:true}));
+  }
+
+  function updateResReadout(){
+    const dpr = USE_HIDPI ? Math.min(window.devicePixelRatio || 1, HIDPI_MAX3 ? 3 : 2) : 1;
+    const eff = (dpr * RENDER_SCALE).toFixed(2);
+    UI.res.textContent = `Res ${eff}×  •  ${W}×${H}px`;
+  }
+
+  function applyDisplaySettings(){
+    RENDER_SCALE = parseFloat(UI.renderScale.value) || 1;
+    USE_HIDPI = !!UI.hidpi.checked;
+    HIDPI_MAX3 = !!UI.hidpi3.checked;
+    resize();
   }
 
   // Sacred-geometry-ish field
@@ -228,7 +264,6 @@
       idx: i
     }));
   }
-  makeNodes(+UI.nodes.value);
 
   function applyFromSliders(){
     const desired = +UI.nodes.value|0;
@@ -236,10 +271,14 @@
     timeScale = +UI.warp.value;
   }
 
-  // Randomize with constraints (trail ≥50% of range, radius ≤50% of range)
+  // Randomize with constraints; EXCLUDE display controls
   function randomizeAll(){
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const id = inp.id;
+
+      // Skip renderScale (and any future display sliders)
+      if (id === 'renderScale') continue;
+
       const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
       const span = max - min;
 
@@ -279,6 +318,15 @@
   });
   UI.nodes.addEventListener('input', applyFromSliders);
   UI.warp.addEventListener('input', applyFromSliders);
+
+  // Display events
+  UI.renderScale.addEventListener('input', applyDisplaySettings);
+  UI.hidpi.addEventListener('change', applyDisplaySettings);
+  UI.hidpi3.addEventListener('change', applyDisplaySettings);
+
+  // Initial sizing
+  resize();
+  makeNodes(+UI.nodes.value);
 
   function draw(now){
     const dtRaw = Math.max(0, (now - last) / 1000); last = now;
@@ -445,12 +493,10 @@
 
   let midiAccess = null;
   let learnMode  = false;
-  let learnTarget = null; // DOM <input type=range> currently selected for learning
-  /** bindings: array of { targetId, type:'cc'|'pb'|'at'|'note', channel, deviceId, controller?, note?, deviceName } */
+  let learnTarget = null;
   let bindings = [];
-
-  // Persist bindings
   const BINDINGS_KEY = 'glitchMeshMidiBindings_v1';
+
   function saveBindings(){ try{ localStorage.setItem(BINDINGS_KEY, JSON.stringify(bindings)); }catch(e){} }
   function loadBindings(){
     try {
@@ -491,11 +537,9 @@
 
   function attachAllInputs(){
     if (!midiAccess) return;
-    // Remove existing listeners
     for (const input of midiAccess.inputs.values()){
       try { input.onmidimessage = null; } catch(e){}
     }
-    // Attach new listeners to ALL inputs
     for (const input of midiAccess.inputs.values()){
       input.onmidimessage = (e) => handleMIDIMessage(e, input);
     }
@@ -516,7 +560,6 @@
     }
   });
 
-  // Clicking any slider selects it as learnTarget (and for "Clear Selected")
   for (const inp of panel.querySelectorAll('input[type="range"]')){
     inp.addEventListener('click', () => {
       setLearnTarget(inp);
@@ -591,13 +634,11 @@
     } else if (msg.type === 'at'){
       binding = { targetId: targetEl.id, type:'at', channel, deviceId, deviceName };
     } else if (msg.type === 'note'){
-      // Bind to a specific note's velocity if you like keys as faders
       binding = { targetId: targetEl.id, type:'note', channel, deviceId, note: msg.note, deviceName };
     }
 
     if (!binding) return false;
 
-    // Replace existing binding for this slider
     removeBindingForTarget(targetEl.id);
     bindings.push(binding);
     showBadge(targetEl, bindingLabel(binding));
@@ -607,8 +648,8 @@
 
   function matchesBinding(b, msg){
     if (!b || !msg) return false;
-    if (b.deviceId !== msg.deviceId) return false;   // per-device binding
-    if (b.channel  !== msg.channel)  return false;   // per-channel binding
+    if (b.deviceId !== msg.deviceId) return false;
+    if (b.channel  !== msg.channel)  return false;
     if (b.type     !== msg.type)     return false;
     if (b.type === 'cc'   && b.controller !== msg.cc)   return false;
     if (b.type === 'note' && b.note       !== msg.note) return false;
@@ -619,64 +660,44 @@
     const el = document.getElementById(b.targetId);
     if (!el) return;
 
-    // Convert message to 0..1
     let norm = 0;
     switch(msg.type){
       case 'cc':  norm = msg.value / 127; break;
       case 'at':  norm = msg.value / 127; break;
       case 'note': norm = msg.vel / 127; break;
-      case 'pb':  norm = msg.value14 / 16383; break; // 0..1
+      case 'pb':  norm = msg.value14 / 16383; break;
       default: return;
     }
 
-    // Map to slider range
     const min=+el.min, max=+el.max;
     const val = min + norm * (max - min);
     setSliderValue(el, val);
-
-    // If special setup sliders changed, ensure sim updates (handled by 'input' dispatch)
   }
 
-  // Parse incoming MIDI and either learn or apply
   function handleMIDIMessage(e, input){
     const d = e.data;
     if (!d || d.length === 0) return;
 
     const status = d[0];
-    // System Real-time (clock/start/stop) not used for learn/apply here
-    if (status >= 0xF8) return;
+    if (status >= 0xF8) return; // ignore realtime for learn/apply
 
     const typeByte = status & 0xF0;
     const channel = (status & 0x0F) + 1;
     const deviceId = input && input.id || 'unknown';
     const deviceName = (input && (input.name || input.manufacturer)) || 'MIDI';
 
-    // Build a generic message object we can use for both learn & apply
     let msg = null;
     switch(typeByte){
-      case 0xB0: // CC
-        msg = { type:'cc', channel, deviceId, deviceName, cc: d[1]||0, value: d[2]||0 };
-        break;
-      case 0xE0: { // Pitch bend
-        const value14 = ((d[2]||0) << 7) | (d[1]||0);
-        msg = { type:'pb', channel, deviceId, deviceName, value14 };
-        break;
-      }
-      case 0xD0: // Channel pressure (aftertouch)
-        msg = { type:'at', channel, deviceId, deviceName, value: d[1]||0 };
-        break;
-      case 0x90: // Note On (use velocity as "value")
-        if ((d[2]||0) === 0) return; // treat as Note Off -> ignore
-        msg = { type:'note', channel, deviceId, deviceName, note: d[1]||0, vel: d[2]||0 };
-        break;
-      default:
-        return; // other types ignored for mapping
+      case 0xB0: msg = { type:'cc', channel, deviceId, deviceName, cc: d[1]||0, value: d[2]||0 }; break;
+      case 0xE0: { const value14 = ((d[2]||0) << 7) | (d[1]||0); msg = { type:'pb', channel, deviceId, deviceName, value14 }; break; }
+      case 0xD0: msg = { type:'at', channel, deviceId, deviceName, value: d[1]||0 }; break;
+      case 0x90: if ((d[2]||0) === 0) return; msg = { type:'note', channel, deviceId, deviceName, note: d[1]||0, vel: d[2]||0 }; break;
+      default: return;
     }
 
     if (learnMode && learnTarget){
       if (createBindingFromMessage(learnTarget, msg)){
         setMidiStatus(`Mapped ${bindingLabel(bindings.find(b=>b.targetId===learnTarget.id))} → “${learnTarget.id}”`);
-        // Exit learn mode after a successful binding
         learnMode = false;
         midiLearnBtn.classList.remove('active');
         midiLearnBtn.textContent = '🎯 Learn: Off';
@@ -687,14 +708,11 @@
       return;
     }
 
-    // Apply: run through bindings and update any matching sliders
     for (const b of bindings){
       if (matchesBinding(b, msg)) applyMessageToBinding(b, msg);
     }
   }
 
-  // Load any saved bindings even before Enable (for badges);
-  // they’ll become active once MIDI is enabled and inputs are attached.
   loadBindings();
 })();
 </script>
