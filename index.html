@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-<title>glitch-mesh — psychedelic + MIDI Learn + HiDPI/Supersample</title>
+<title>glitch-mesh — optimized + MIDI Learn + HiDPI/Supersample</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
@@ -13,8 +13,8 @@
   #ui {
     position:fixed;
     left:50%;
-    bottom:58px;                   /* sits above the toggle pill */
-    transform:translate(-50%, 12px); /* slightly below when closed */
+    bottom:58px;
+    transform:translate(-50%, 12px);
     width:min(1200px, 100vw - 20px);
     max-height:65vh;
     overflow-y:auto;
@@ -50,20 +50,14 @@
     border-radius:999px; padding:2px 6px;
   }
 
-  /* Learn highlight */
-  .learn-target {
-    outline:2px solid #7fb0ff; border-radius:12px;
-    box-shadow:0 0 0 4px rgba(127,176,255,.22);
-  }
+  .learn-target { outline:2px solid #7fb0ff; border-radius:12px; box-shadow:0 0 0 4px rgba(127,176,255,.22); }
 
-  /* Bottom toggle pill */
   #uiToggleWrap {
     position:fixed; left:50%; bottom:10px; transform:translateX(-50%);
     background:rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.25);
     border-radius:999px; padding:8px 12px; color:#fff; font:13px system-ui,sans-serif;
     display:flex; align-items:center; gap:8px; z-index:11;
-    box-shadow:0 4px 16px rgba(0,0,0,.4);
-    user-select:none;
+    box-shadow:0 4px 16px rgba(0,0,0,.4); user-select:none;
   }
   #uiToggle { width:18px; height:18px; accent-color:#7fb0ff; }
 </style>
@@ -75,7 +69,10 @@
 <div id="ui">
   <!-- Structure -->
   <div class="g"><label>Nodes</label><input id="nodes" type="range" min="40" max="500" step="10" value="160"><span class="midi-badge" hidden></span></div>
-  <div class="g"><label>Link Radius</label><input id="radius" type="range" min="40" max="500" step="5" value="180"><span class="midi-badge" hidden></span></div>
+
+  <!-- ↓↓↓ Link Radius max reduced to 80% (500 → 400) ↓↓↓ -->
+  <div class="g"><label>Link Radius</label><input id="radius" type="range" min="40" max="400" step="5" value="180"><span class="midi-badge" hidden></span></div>
+
   <div class="g"><label>Edge Thicc</label><input id="thick" type="range" min="0.4" max="4" step="0.1" value="1.2"><span class="midi-badge" hidden></span></div>
 
   <!-- Motion/feel -->
@@ -139,9 +136,9 @@
   let W=0, H=0;
 
   // --- Display / scale state ---
-  let USE_HIDPI = false;     // OFF by default
-  let HIDPI_MAX3 = false;    // OFF by default (cap DPR at 2 unless this is on)
-  let RENDER_SCALE = 1.00;   // 1.00 by default
+  let USE_HIDPI = false;
+  let HIDPI_MAX3 = false;
+  let RENDER_SCALE = 1.00;
 
   function effectiveScale(){
     const dpr = USE_HIDPI ? Math.min(window.devicePixelRatio || 1, HIDPI_MAX3 ? 3 : 2) : 1;
@@ -173,12 +170,7 @@
     warp:  $('#warp'), fiboSpeed: $('#fiboSpeed'),
     psyOn: $('#psyOn'), psyInf: $('#psyInf'), psySym: $('#psySym'),
     psyFreq: $('#psyFreq'), psyLayers: $('#psyLayers'), psyFlow: $('#psyFlow'),
-
-    // Display controls
-    renderScale: $('#renderScale'),
-    hidpi: $('#hidpi'),
-    hidpi3: $('#hidpi3'),
-    res: $('#res')
+    renderScale: $('#renderScale'), hidpi: $('#hidpi'), hidpi3: $('#hidpi3'), res: $('#res')
   };
 
   // State
@@ -275,9 +267,7 @@
   function randomizeAll(){
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const id = inp.id;
-
-      // Skip renderScale (and any future display sliders)
-      if (id === 'renderScale') continue;
+      if (id === 'renderScale') continue; // do not randomize display
 
       const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
       const span = max - min;
@@ -324,9 +314,127 @@
   UI.hidpi.addEventListener('change', applyDisplaySettings);
   UI.hidpi3.addEventListener('change', applyDisplaySettings);
 
-  // Initial sizing
+  // Initial sizing & nodes
   resize();
   makeNodes(+UI.nodes.value);
+
+  // === OPTIMIZED EDGES: helpers ===
+  const BUCKET_DEG = 24;              // hue bucket width (deg)
+  const ALPHA_BUCKETS = 5;            // alpha quantization levels
+  const HUE_BUCKETS = Math.floor(360/BUCKET_DEG);
+  function pairHash(i,j){             // stable 0..1 hash for a pair (no allocations)
+    const x = ((i*73856093) ^ (j*19349663)) >>> 0;
+    return x / 4294967295;
+  }
+
+  // === OPTIMIZED EDGES: main drawing using spatial grid + bucketed strokes ===
+  function drawEdgesOptimized(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ){
+    const reach0 = linkR * 0.6, reach1 = linkR;
+    const reach02 = reach0*reach0, reach12 = reach1*reach1;
+
+    // 1) Build spatial grid (cell ≈ linkR so neighbors are in 3×3 cells)
+    const cell = Math.max(8, linkR|0);
+    const cols = Math.floor(W / cell) + 1;
+    const rows = Math.floor(H / cell) + 1;
+    const bins = new Array(cols*rows);
+    for (let i=0;i<bins.length;i++) bins[i] = [];
+    for (let i=0;i<nodes.length;i++){
+      const n = nodes[i];
+      const cx = (n.x / cell)|0, cy = (n.y / cell)|0;
+      const idx = cy*cols + cx;
+      if (bins[idx]) bins[idx].push(i);
+    }
+
+    // 2) Pre-create bucketed Path2D containers
+    const paths = [[],[]], counts = [[],[]];
+    for (let p=0;p<2;p++){
+      paths[p] = Array.from({length:HUE_BUCKETS}, () => Array.from({length:ALPHA_BUCKETS}, () => new Path2D()));
+      counts[p] = Array.from({length:HUE_BUCKETS}, () => Array(ALPHA_BUCKETS).fill(0));
+    }
+
+    // 3) Visit neighbors and push segments into buckets
+    for (let i=0;i<nodes.length;i++){
+      const a = nodes[i];
+      const acx=(a.x/cell)|0, acy=(a.y/cell)|0;
+      for (let ny=acy-1; ny<=acy+1; ny++){
+        if (ny<0 || ny>=rows) continue;
+        for (let nx=acx-1; nx<=acx+1; nx++){
+          if (nx<0 || nx>=cols) continue;
+          const bin = bins[ny*cols + nx];
+          if (!bin) continue;
+          for (let k=0;k<bin.length;k++){
+            const j = bin[k];
+            if (j<=i) continue; // dedup
+
+            const b = nodes[j];
+            const dx = a.x - b.x, dy = a.y - b.y;
+            const d2 = dx*dx + dy*dy;
+            if (d2 >= reach12) continue; // too far for both passes
+
+            const d = Math.sqrt(d2);
+            const baseHue = (edgeBase + edgePhaseQ + pairHash(i,j)*360) % 360;
+            const hueBucket = ((baseHue/BUCKET_DEG)|0) % HUE_BUCKETS;
+
+            // mid-segment (will add small warp/jitter)
+            let mx = (a.x+b.x)/2, my=(a.y+b.y)/2;
+
+            // pass 0 (thinner/shorter reach)
+            if (d2 < reach02){
+              const fade0 = 1 - d/reach0;
+              let jx = rndN(6 + 22*fade0), jy = rndN(6 + 22*fade0);
+              const pth = paths[0][hueBucket];
+              const alpha0 = clamp(0.06 + 0.25*fade0, 0, 0.55);
+              const aIdx0 = Math.min(ALPHA_BUCKETS-1, (alpha0/0.55*ALPHA_BUCKETS)|0);
+              const path0 = pth[aIdx0];
+              path0.moveTo(a.x, a.y);
+              path0.lineTo(mx + jx, my + jy);
+              path0.lineTo(b.x, b.y);
+              counts[0][hueBucket][aIdx0]++;
+            }
+
+            // pass 1 (thicker/full reach)
+            if (d2 < reach12){
+              const fade1 = 1 - d/reach1;
+              let jx = rndN(6 + 22*fade1), jy = rndN(6 + 22*fade1);
+              if (psyON && psyInf>0){
+                // compute sacred-field warp ONLY on thick pass (perf-friendly)
+                const Fm = fieldValue(mx,my,tField,psySym,psyFreq,psyLayers);
+                const w = Math.sin(Fm*1.5+now*0.001)*8;
+                jx += w; jy -= w;
+              }
+              const pth = paths[1][hueBucket];
+              const alpha1 = clamp(0.12 + 0.35*fade1, 0, 0.55);
+              const aIdx1 = Math.min(ALPHA_BUCKETS-1, (alpha1/0.55*ALPHA_BUCKETS)|0);
+              const path1 = pth[aIdx1];
+              path1.moveTo(a.x, a.y);
+              path1.lineTo(mx + jx, my + jy);
+              path1.lineTo(b.x, b.y);
+              counts[1][hueBucket][aIdx1]++;
+            }
+          }
+        }
+      }
+    }
+
+    // 4) Stroke buckets (few strokes total)
+    ctx.lineCap = 'round';
+    for (let pass=0; pass<2; pass++){
+      ctx.lineWidth = thick*(pass?1:0.5);
+      for (let hb=0; hb<HUE_BUCKETS; hb++){
+        const bucketHue = (edgeBase + edgePhaseQ + hb*BUCKET_DEG + BUCKET_DEG*0.5) % 360;
+        ctx.strokeStyle = `hsl(${bucketHue},95%,55%)`;
+        const arr = paths[pass][hb];
+        for (let ab=0; ab<ALPHA_BUCKETS; ab++){
+          if (!counts[pass][hb][ab]) continue;
+          const repAlpha = ((ab+0.5)/ALPHA_BUCKETS) * 0.55;
+          ctx.save();
+          ctx.globalAlpha = repAlpha;
+          ctx.stroke(arr[ab]);
+          ctx.restore();
+        }
+      }
+    }
+  }
 
   function draw(now){
     const dtRaw = Math.max(0, (now - last) / 1000); last = now;
@@ -416,45 +524,8 @@
         ctx.fill();
       }
 
-      // Edges (colored)
-      const N = nodes.length;
-      ctx.lineCap = 'round';
-      for (let pass=0; pass<2; pass++){
-        ctx.lineWidth = (thick * (pass?1:0.5));
-        let edgeIdx = 0;
-        for (let i=0;i<N;i++){
-          const a = nodes[i];
-          for (let j=i+1;j<N;j++, edgeIdx++){
-            const b = nodes[j];
-            const dx = a.x - b.x, dy = a.y - b.y;
-            const d = Math.hypot(dx,dy);
-            const reach = linkR * (pass?1.0:0.6);
-            if (d < reach){
-              const fade = 1 - d / reach;
-              const ehue = (edgeBase + edgeIdx * GOLDEN_ANGLE + edgePhaseQ) % 360;
-              const baseAlpha = pass ? 0.12 : 0.06;
-              const alphaScale = pass ? 0.35 : 0.25;
-              const aEdge = clamp(baseAlpha + alphaScale * fade, 0, 0.55);
-              let mx = (a.x+b.x)/2, my=(a.y+b.y)/2;
-              if (psyON && psyInf>0){
-                const Fm = fieldValue(mx,my,tField,psySym,psyFreq,psyLayers);
-                const w = Math.sin(Fm*1.5+now*0.001)*8;
-                mx += (Math.random()*2-1)*(6 + 22*fade) + w;
-                my += (Math.random()*2-1)*(6 + 22*fade) - w;
-              } else {
-                mx += (Math.random()*2-1)*(6 + 22*fade);
-                my += (Math.random()*2-1)*(6 + 22*fade);
-              }
-              ctx.strokeStyle = `hsla(${ehue}, 95%, 55%, ${aEdge})`;
-              ctx.beginPath();
-              ctx.moveTo(a.x, a.y);
-              ctx.lineTo(mx, my);
-              ctx.lineTo(b.x, b.y);
-              ctx.stroke();
-            }
-          }
-        }
-      }
+      // === OPTIMIZED EDGES call (replaces old O(N^2) loop) ===
+      drawEdgesOptimized(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ);
 
       // Snapshot for feedback
       fbc.clearRect(0,0,W,H);
@@ -537,9 +608,7 @@
 
   function attachAllInputs(){
     if (!midiAccess) return;
-    for (const input of midiAccess.inputs.values()){
-      try { input.onmidimessage = null; } catch(e){}
-    }
+    for (const input of midiAccess.inputs.values()){ try { input.onmidimessage = null; } catch(e){} }
     for (const input of midiAccess.inputs.values()){
       input.onmidimessage = (e) => handleMIDIMessage(e, input);
     }
@@ -547,27 +616,19 @@
 
   midiEnableBtn.addEventListener('click', enableMIDI);
 
-  // Learn workflow
   midiLearnBtn.addEventListener('click', () => {
     learnMode = !learnMode;
     midiLearnBtn.classList.toggle('active', learnMode);
     midiLearnBtn.textContent = learnMode ? '🎯 Learn: On' : '🎯 Learn: Off';
-    if (learnMode) {
-      setMidiStatus('LEARN: click a slider, then move a MIDI control…');
-    } else {
-      clearLearnTarget();
-      setMidiStatus('learn off');
-    }
+    if (learnMode) setMidiStatus('LEARN: click a slider, then move a MIDI control…');
+    else { clearLearnTarget(); setMidiStatus('learn off'); }
   });
 
   for (const inp of panel.querySelectorAll('input[type="range"]')){
     inp.addEventListener('click', () => {
       setLearnTarget(inp);
-      if (learnMode) {
-        setMidiStatus(`LEARN: move a MIDI control for “${inp.id}”`);
-      } else {
-        setMidiStatus(`Selected “${inp.id}”`);
-      }
+      if (learnMode) setMidiStatus(`LEARN: move a MIDI control for “${inp.id}”`);
+      else setMidiStatus(`Selected “${inp.id}”`);
     });
   }
 
@@ -586,59 +647,23 @@
     saveBindings();
   });
 
-  function setLearnTarget(el){
-    if (learnTarget) learnTarget.classList.remove('learn-target');
-    learnTarget = el;
-    el.classList.add('learn-target');
-  }
-  function clearLearnTarget(){
-    if (learnTarget) learnTarget.classList.remove('learn-target');
-    learnTarget = null;
-  }
+  function setLearnTarget(el){ if (learnTarget) learnTarget.classList.remove('learn-target'); learnTarget = el; el.classList.add('learn-target'); }
+  function clearLearnTarget(){ if (learnTarget) learnTarget.classList.remove('learn-target'); learnTarget = null; }
 
-  function showBadge(el, text){
-    const badge = el.parentElement.querySelector('.midi-badge');
-    if (badge){ badge.textContent = '🔗 ' + text; badge.hidden = false; }
-  }
-  function hideBadge(el){
-    const badge = el.parentElement.querySelector('.midi-badge');
-    if (badge){ badge.hidden = true; badge.textContent=''; }
-  }
+  function showBadge(el, text){ const b = el.parentElement.querySelector('.midi-badge'); if (b){ b.textContent = '🔗 ' + text; b.hidden = false; } }
+  function hideBadge(el){ const b = el.parentElement.querySelector('.midi-badge'); if (b){ b.hidden = true; b.textContent=''; } }
 
-  function removeBindingForTarget(targetId){
-    const before = bindings.length;
-    bindings = bindings.filter(b => b.targetId !== targetId);
-    return before !== bindings.length;
-  }
-
-  function bindingLabel(b){
-    switch(b.type){
-      case 'cc':   return `CC${b.controller} ch${b.channel}`;
-      case 'pb':   return `PitchBend ch${b.channel}`;
-      case 'at':   return `Aftertouch ch${b.channel}`;
-      case 'note': return `Note${b.note} ch${b.channel}`;
-      default:     return `MIDI ch${b.channel}`;
-    }
-  }
+  function removeBindingForTarget(targetId){ const before = bindings.length; bindings = bindings.filter(b => b.targetId !== targetId); return before !== bindings.length; }
+  function bindingLabel(b){ switch(b.type){ case 'cc':return `CC${b.controller} ch${b.channel}`; case 'pb':return `PitchBend ch${b.channel}`; case 'at':return `Aftertouch ch${b.channel}`; case 'note':return `Note${b.note} ch${b.channel}`; default:return `MIDI ch${b.channel}`; } }
 
   function createBindingFromMessage(targetEl, msg){
-    const deviceId = msg.deviceId;
-    const deviceName = msg.deviceName;
-    const channel = msg.channel;
+    const deviceId = msg.deviceId, deviceName = msg.deviceName, channel = msg.channel;
     let binding = null;
-
-    if (msg.type === 'cc'){
-      binding = { targetId: targetEl.id, type:'cc', channel, deviceId, controller: msg.cc, deviceName };
-    } else if (msg.type === 'pb'){
-      binding = { targetId: targetEl.id, type:'pb', channel, deviceId, deviceName };
-    } else if (msg.type === 'at'){
-      binding = { targetId: targetEl.id, type:'at', channel, deviceId, deviceName };
-    } else if (msg.type === 'note'){
-      binding = { targetId: targetEl.id, type:'note', channel, deviceId, note: msg.note, deviceName };
-    }
-
+    if (msg.type === 'cc') binding = { targetId: targetEl.id, type:'cc', channel, deviceId, controller: msg.cc, deviceName };
+    else if (msg.type === 'pb') binding = { targetId: targetEl.id, type:'pb', channel, deviceId, deviceName };
+    else if (msg.type === 'at') binding = { targetId: targetEl.id, type:'at', channel, deviceId, deviceName };
+    else if (msg.type === 'note') binding = { targetId: targetEl.id, type:'note', channel, deviceId, note: msg.note, deviceName };
     if (!binding) return false;
-
     removeBindingForTarget(targetEl.id);
     bindings.push(binding);
     showBadge(targetEl, bindingLabel(binding));
@@ -657,9 +682,7 @@
   }
 
   function applyMessageToBinding(b, msg){
-    const el = document.getElementById(b.targetId);
-    if (!el) return;
-
+    const el = document.getElementById(b.targetId); if (!el) return;
     let norm = 0;
     switch(msg.type){
       case 'cc':  norm = msg.value / 127; break;
@@ -668,24 +691,18 @@
       case 'pb':  norm = msg.value14 / 16383; break;
       default: return;
     }
-
     const min=+el.min, max=+el.max;
     const val = min + norm * (max - min);
     setSliderValue(el, val);
   }
 
   function handleMIDIMessage(e, input){
-    const d = e.data;
-    if (!d || d.length === 0) return;
-
-    const status = d[0];
-    if (status >= 0xF8) return; // ignore realtime for learn/apply
-
+    const d = e.data; if (!d || d.length===0) return;
+    const status = d[0]; if (status >= 0xF8) return; // ignore realtime here
     const typeByte = status & 0xF0;
     const channel = (status & 0x0F) + 1;
     const deviceId = input && input.id || 'unknown';
     const deviceName = (input && (input.name || input.manufacturer)) || 'MIDI';
-
     let msg = null;
     switch(typeByte){
       case 0xB0: msg = { type:'cc', channel, deviceId, deviceName, cc: d[1]||0, value: d[2]||0 }; break;
@@ -694,26 +711,19 @@
       case 0x90: if ((d[2]||0) === 0) return; msg = { type:'note', channel, deviceId, deviceName, note: d[1]||0, vel: d[2]||0 }; break;
       default: return;
     }
-
     if (learnMode && learnTarget){
       if (createBindingFromMessage(learnTarget, msg)){
         setMidiStatus(`Mapped ${bindingLabel(bindings.find(b=>b.targetId===learnTarget.id))} → “${learnTarget.id}”`);
-        learnMode = false;
-        midiLearnBtn.classList.remove('active');
-        midiLearnBtn.textContent = '🎯 Learn: Off';
-        clearLearnTarget();
-      } else {
-        setMidiStatus('Unsupported message for learn', false);
-      }
+        learnMode = false; midiLearnBtn.classList.remove('active'); midiLearnBtn.textContent = '🎯 Learn: Off'; clearLearnTarget();
+      } else setMidiStatus('Unsupported message for learn', false);
       return;
     }
-
-    for (const b of bindings){
-      if (matchesBinding(b, msg)) applyMessageToBinding(b, msg);
-    }
+    for (const b of bindings){ if (matchesBinding(b, msg)) applyMessageToBinding(b, msg); }
   }
 
-  loadBindings();
+  // Initial motion + load mappings
+  setTimeout(() => { hueBase = Math.random()*360; edgeBase = Math.random()*360; for (const n of nodes){ const s=1.5+Math.random()*3.0; const a=Math.random()*Math.PI*2; n.vx=Math.cos(a)*s; n.vy=Math.sin(a)*s; }}, 250);
+  (function loadBindings(){ try{ const raw = localStorage.getItem('glitchMeshMidiBindings_v1'); if (!raw) return; const arr=JSON.parse(raw); if (Array.isArray(arr)){ bindings=arr; for (const b of bindings){ const el=document.getElementById(b.targetId); if (el) { const lbl=(b.type==='cc'?`CC${b.controller}`:b.type==='pb'?'PitchBend':b.type==='at'?'Aftertouch':`Note${b.note}`)+` ch${b.channel}`; const badge=el.parentElement.querySelector('.midi-badge'); if (badge){ badge.textContent='🔗 '+lbl; badge.hidden=false; } } } } }catch(e){} })();
 })();
 </script>
 </body>
