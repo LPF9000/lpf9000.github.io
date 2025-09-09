@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-<title>glitch-mesh — crisp + fast + MIDI Learn</title>
+<title>glitch-mesh — crisp + tuned randomize + MIDI Learn</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
@@ -95,8 +95,6 @@
   <div class="g"><label>HiDPI Max 3×</label><input id="hidpi3" type="checkbox"></div>
   <div class="g"><label>Auto Quality</label><input id="autoQ" type="checkbox" checked></div>
   <div class="g"><label>Pixel Budget (MP)</label><input id="pxBudget" type="range" min="1" max="8" step="0.5" value="3"></div>
-  <div class="g"><label>FPS Guard</label><input id="fpsGuard" type="checkbox" checked></div>
-  <div class="g"><label>FPS Target</label><input id="fpsTarget" type="range" min="30" max="90" step="1" value="58"></div>
   <div class="g"><label>Crisp Feedback</label><input id="crisp" type="checkbox" checked></div>
 
   <!-- MIDI -->
@@ -131,15 +129,12 @@
 
   let W=0, H=0;
 
-  // --- Display / scale state ---
+  // --- Display / scale state (no FPS guard) ---
   let USE_HIDPI = false;     // OFF by default
   let HIDPI_MAX3 = false;    // OFF by default
   let RENDER_SCALE = 1.00;   // 1.00 default
   let AUTO_QUALITY = true;   // ON by default
   let PIXEL_BUDGET_MP = 3.0; // 3MP default
-  let FPS_GUARD = true;      // ON by default
-  let FPS_TARGET = 58;       // target FPS
-  let guardScale = 1.0;      // 1.0 = no reduction
   let CRISP = true;          // image smoothing off (crisp)
 
   function applyCrispness(){
@@ -147,30 +142,22 @@
     fbc.imageSmoothingEnabled = !CRISP ? true : false;
   }
 
-  function computeScales(){
+  function effectiveScale(){
     const dpr = USE_HIDPI ? Math.min(window.devicePixelRatio || 1, HIDPI_MAX3 ? 3 : 2) : 1;
     const desired = dpr * RENDER_SCALE;
+    if (!AUTO_QUALITY) return desired;
 
-    // Auto Quality cap
-    let cap = desired;
-    if (AUTO_QUALITY){
-      const pxBudget = PIXEL_BUDGET_MP * 1_000_000;
-      const pxCSS = innerWidth * innerHeight;
-      const maxScale = Math.sqrt(Math.max(1, pxBudget) / Math.max(1, pxCSS));
-      cap = Math.min(desired, maxScale);
-    }
-
-    // FPS guard
-    const final = cap * (FPS_GUARD ? guardScale : 1.0);
-    return { dpr, desired, cap, final, capped: cap + 1e-6 < desired, guarded: FPS_GUARD && guardScale < 0.999 };
+    const pxBudget = PIXEL_BUDGET_MP * 1_000_000;
+    const pxCSS = innerWidth * innerHeight;
+    const maxScale = Math.sqrt(Math.max(1, pxBudget) / Math.max(1, pxCSS));
+    return Math.min(desired, maxScale);
   }
 
-  function effectiveScale(){ return computeScales().final; }
-
   function updateResReadout(){
-    const s = computeScales();
-    const flags = (s.capped ? ' • auto-capped' : '') + (s.guarded ? ' • fps-guard' : '');
-    UI.res.textContent = `Res ${s.final.toFixed(2)}×  •  ${W}×${H}px${flags}`;
+    const scale = effectiveScale();
+    const newW = Math.floor(innerWidth  * scale);
+    const newH = Math.floor(innerHeight * scale);
+    UI.res.textContent = `Res ${scale.toFixed(2)}×  •  ${newW}×${newH}px`;
   }
 
   function resize(){
@@ -178,11 +165,9 @@
     const newW = Math.floor(innerWidth  * scale);
     const newH = Math.floor(innerHeight * scale);
     if (newW === W && newH === H) { updateResReadout(); return; }
-
     W = cv.width  = newW;
     H = cv.height = newH;
     fb.width = W; fb.height = H;
-
     applyCrispness();
     updateResReadout();
   }
@@ -208,9 +193,7 @@
 
     // Display controls
     renderScale: $('#renderScale'), hidpi: $('#hidpi'), hidpi3: $('#hidpi3'),
-    autoQ: $('#autoQ'), pxBudget: $('#pxBudget'),
-    fpsGuard: $('#fpsGuard'), fpsTarget: $('#fpsTarget'),
-    crisp: $('#crisp'),
+    autoQ: $('#autoQ'), pxBudget: $('#pxBudget'), crisp: $('#crisp'),
     res: $('#res')
   };
 
@@ -228,7 +211,7 @@
   let edgePhase = 0;
 
   // FPS
-  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0, lastFPS=60;
+  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
 
   // Utils
   const rnd  = (a=1)=> Math.random()*a;
@@ -251,8 +234,6 @@
     HIDPI_MAX3     = !!UI.hidpi3.checked;
     AUTO_QUALITY   = !!UI.autoQ.checked;
     PIXEL_BUDGET_MP= parseFloat(UI.pxBudget.value) || 3.0;
-    FPS_GUARD      = !!UI.fpsGuard.checked;
-    FPS_TARGET     = parseInt(UI.fpsTarget.value,10) || 58;
     CRISP          = !!UI.crisp.checked;
     resize();
   }
@@ -303,32 +284,94 @@
     timeScale = +UI.warp.value;
   }
 
-  // Randomize with constraints; EXCLUDE display + perf controls
-  const SKIP_RANDOM = new Set(['renderScale','hidpi','hidpi3','autoQ','pxBudget','fpsGuard','fpsTarget','crisp','edgeBudget']);
+  // ---------- Randomize tuned to defaults & your trail/feedback rules ----------
+  const SKIP_RANDOM = new Set(['renderScale','hidpi','hidpi3','autoQ','pxBudget','crisp','edgeBudget']);
+
+  function triSample(min, mode, max){
+    // Triangular(min, mode, max)
+    const u = Math.random();
+    const c = (mode - min) / (max - min);
+    if (u < c) return min + Math.sqrt(u * (max - min) * (mode - min));
+    return max - Math.sqrt((1 - u) * (max - min) * (max - mode));
+  }
+  function skewUp(u, k){ return Math.pow(u, 1/Math.max(1e-6,k)); }   // k>1 pushes toward 1
+  function skewDown(u, k){ return Math.pow(u, Math.max(1e-6,k)); }   // k>1 pushes toward 0
+
+  function pickFeedbackTrail(){
+    // Buckets: [fbMin, fbMax], [trailMin, trailMax], weight
+    const B = [
+      { fb:[0.90,1.00], tr:[0.80,1.00], w:0.28 },
+      { fb:[0.45,0.55], tr:[0.75,1.00], w:0.24 },
+      { fb:[0.22,0.28], tr:[0.60,1.00], w:0.20 },
+      { fb:[0.13,0.17], tr:[0.50,1.00], w:0.15 },
+      { fb:[0.00,0.10], tr:[0.00,1.00], w:0.13 }
+    ];
+    let r = Math.random(), i=0;
+    let acc = 0; for (; i<B.length; i++){ acc += B[i].w; if (r <= acc) break; } if (i>=B.length) i=B.length-1;
+    const b = B[i];
+    const fb = b.fb[0] + Math.random()*(b.fb[1]-b.fb[0]);
+    // Bias trail high within allowed band to reduce wash-out
+    const u = skewUp(Math.random(), 2.2); // bias toward 1
+    let tr = b.tr[0] + u*(b.tr[1]-b.tr[0]);
+    tr = Math.min(tr, +UI.trail.max); // respect 0.95 ceiling
+    return { fb, tr };
+  }
+
   function randomizeAll(){
+    // 1) Feedback/Trail according to your mapping
+    const ft = pickFeedbackTrail();
+    setSliderValue(UI.feedback, ft.fb);
+    setSliderValue(UI.trail,    ft.tr);
+
+    // 2) Link Radius — triangular around default, but limited to lower half of slider
+    (function(){
+      const min = +UI.radius.min, max = +UI.radius.max;
+      const span = max - min;
+      const capMax = min + 0.5*span;       // keep inside lower half for perf
+      const mode = +UI.radius.value;       // default (180)
+      const v = triSample(min, mode, capMax);
+      setSliderValue(UI.radius, v);
+    })();
+
+    // 3) Edge Thicc — triangular around default (1.2), with a sensible window
+    (function(){
+      const min = +UI.thick.min, max = +UI.thick.max;
+      const mode = +UI.thick.value;        // default (1.2)
+      const lo = Math.max(min, mode - 0.6);
+      const hi = Math.min(max, mode + 1.0);
+      const v = triSample(lo, mode, hi);
+      setSliderValue(UI.thick, v);
+    })();
+
+    // 4) Warp (time) — prefer 0 → default, biased near default
+    (function(){
+      const min = +UI.warp.min, max = +UI.warp.max, def = +UI.warp.value; // def=1.0
+      let v;
+      if (Math.random() < 0.8){
+        // within [min, def], bias toward def
+        const u = skewUp(Math.random(), 2.5);
+        v = min + u * (def - min);
+      } else {
+        // within (def, max], bias back toward def
+        const u = skewDown(Math.random(), 2.2);
+        v = def + u * (max - def);
+      }
+      setSliderValue(UI.warp, v);
+    })();
+
+    // 5) Everything else (uniform) — except items we skip
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const id = inp.id;
       if (SKIP_RANDOM.has(id)) continue;
+      if (id==='trail' || id==='feedback' || id==='radius' || id==='thick' || id==='warp') continue;
 
       const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
       const span = max - min;
-
-      if (id === 'trail') { // 50–95%
-        const val = min + 0.50*span + Math.random()*(0.45*span);
-        inp.value = (+val).toFixed(2);
-        continue;
-      }
-      if (id === 'radius') { // 0–50%
-        const val = min + Math.random()*(0.50*span);
-        const v = Math.round(val/step)*step;
-        inp.value = String(v);
-        continue;
-      }
       const raw = min + Math.random()*span;
       const decimals = (step.toString().split('.')[1]||'').length;
       inp.value = raw.toFixed(decimals);
+      inp.dispatchEvent(new Event('input', {bubbles:true}));
     }
-    applyFromSliders();
 
     // reseed palettes & motion
     hueBase = Math.random()*360;
@@ -356,8 +399,6 @@
   UI.hidpi3.addEventListener('change', applyDisplaySettings);
   UI.autoQ.addEventListener('change', applyDisplaySettings);
   UI.pxBudget.addEventListener('input', applyDisplaySettings);
-  UI.fpsGuard.addEventListener('change', applyDisplaySettings);
-  UI.fpsTarget.addEventListener('input', applyDisplaySettings);
   UI.crisp.addEventListener('change', applyDisplaySettings);
 
   // Initial sizing & nodes
@@ -389,7 +430,7 @@
     return (a >>> 0) / 4294967295;
   }
 
-  // ---------- Optimized edge drawing (sampling + no sqrt) ----------
+  // ---------- Optimized edge drawing (sampling + no sqrt in hot loop) ----------
   function drawEdgesFast(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ){
     const reach0 = linkR * 0.6, reach1 = linkR;
     const reach02 = reach0*reach0, reach12 = reach1*reach1;
@@ -568,26 +609,9 @@
       fbc.drawImage(cv, 0, 0, W, H);
     }
 
-    // FPS meter + guard adapt (every ~0.5s)
+    // FPS meter (display only)
     fpsAcc += 1/Math.max(dtRaw, 1e-6); fpsFrames++; fpsT += dtRaw;
-    if (fpsT > 0.5) {
-      lastFPS = fpsAcc / fpsFrames;
-      fpsEl.textContent = `${lastFPS.toFixed(0)} fps`;
-
-      if (FPS_GUARD){
-        // Gentle down when below target; gentle up when above
-        if (lastFPS < FPS_TARGET - 2) {
-          guardScale = Math.max(0.5, guardScale * 0.96);
-          resize();
-        } else if (lastFPS > FPS_TARGET + 6) {
-          const old = guardScale;
-          guardScale = Math.min(1.0, guardScale * 1.02);
-          if (guardScale !== old) resize();
-        }
-      }
-
-      fpsAcc=0; fpsFrames=0; fpsT=0;
-    }
+    if (fpsT > 0.5) { fpsEl.textContent = `${(fpsAcc/fpsFrames).toFixed(0)} fps`; fpsAcc=0; fpsFrames=0; fpsT=0; }
 
     requestAnimationFrame(draw);
   }
