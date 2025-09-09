@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-<title>glitch-mesh — fast + MIDI Learn + HiDPI/Supersample</title>
+<title>glitch-mesh — crisp + fast + MIDI Learn</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; height:100%; background:#000; overflow:hidden; }
@@ -26,7 +26,6 @@
   .g label { font-size:12px; opacity:.85 }
   .g input[type="range"] { width:140px; }
   .g input[type="checkbox"] { width:18px; height:18px; }
-
   select { background:#111; color:#fff; border:1px solid rgba(255,255,255,.25); border-radius:8px; padding:6px 8px; }
   button {
     appearance:none; background:#111; color:#7fb0ff; border:1px solid #7fb0ff;
@@ -61,10 +60,10 @@
 <div id="ui">
   <!-- Structure -->
   <div class="g"><label>Nodes</label><input id="nodes" type="range" min="40" max="500" step="10" value="160"><span class="midi-badge" hidden></span></div>
-  <!-- Link Radius max reduced to 80% (500 → 400) -->
+  <!-- Link Radius max reduced (500 → 400) to avoid worst-case blowups -->
   <div class="g"><label>Link Radius</label><input id="radius" type="range" min="40" max="400" step="5" value="180"><span class="midi-badge" hidden></span></div>
   <div class="g"><label>Edge Thicc</label><input id="thick" type="range" min="0.4" max="4" step="0.1" value="1.2"><span class="midi-badge" hidden></span></div>
-  <!-- NEW: Edge Budget (avg neighbors per node) -->
+  <!-- Edge Budget (avg neighbors per node) -->
   <div class="g"><label>Edge Budget</label><input id="edgeBudget" type="range" min="4" max="48" step="1" value="16"></div>
 
   <!-- Motion/feel -->
@@ -94,6 +93,11 @@
   <div class="g"><label>Render Scale</label><input id="renderScale" type="range" min="1" max="2" step="0.05" value="1.00"></div>
   <div class="g"><label>HiDPI</label><input id="hidpi" type="checkbox"></div>
   <div class="g"><label>HiDPI Max 3×</label><input id="hidpi3" type="checkbox"></div>
+  <div class="g"><label>Auto Quality</label><input id="autoQ" type="checkbox" checked></div>
+  <div class="g"><label>Pixel Budget (MP)</label><input id="pxBudget" type="range" min="1" max="8" step="0.5" value="3"></div>
+  <div class="g"><label>FPS Guard</label><input id="fpsGuard" type="checkbox" checked></div>
+  <div class="g"><label>FPS Target</label><input id="fpsTarget" type="range" min="30" max="90" step="1" value="58"></div>
+  <div class="g"><label>Crisp Feedback</label><input id="crisp" type="checkbox" checked></div>
 
   <!-- MIDI -->
   <div class="g"><label>MIDI</label><button id="midiEnable" type="button">🎹 Enable MIDI</button></div>
@@ -128,20 +132,58 @@
   let W=0, H=0;
 
   // --- Display / scale state ---
-  let USE_HIDPI = false;
-  let HIDPI_MAX3 = false;
-  let RENDER_SCALE = 1.00;
+  let USE_HIDPI = false;     // OFF by default
+  let HIDPI_MAX3 = false;    // OFF by default
+  let RENDER_SCALE = 1.00;   // 1.00 default
+  let AUTO_QUALITY = true;   // ON by default
+  let PIXEL_BUDGET_MP = 3.0; // 3MP default
+  let FPS_GUARD = true;      // ON by default
+  let FPS_TARGET = 58;       // target FPS
+  let guardScale = 1.0;      // 1.0 = no reduction
+  let CRISP = true;          // image smoothing off (crisp)
 
-  function effectiveScale(){
+  function applyCrispness(){
+    ctx.imageSmoothingEnabled = !CRISP ? true : false;
+    fbc.imageSmoothingEnabled = !CRISP ? true : false;
+  }
+
+  function computeScales(){
     const dpr = USE_HIDPI ? Math.min(window.devicePixelRatio || 1, HIDPI_MAX3 ? 3 : 2) : 1;
-    return dpr * RENDER_SCALE;
+    const desired = dpr * RENDER_SCALE;
+
+    // Auto Quality cap
+    let cap = desired;
+    if (AUTO_QUALITY){
+      const pxBudget = PIXEL_BUDGET_MP * 1_000_000;
+      const pxCSS = innerWidth * innerHeight;
+      const maxScale = Math.sqrt(Math.max(1, pxBudget) / Math.max(1, pxCSS));
+      cap = Math.min(desired, maxScale);
+    }
+
+    // FPS guard
+    const final = cap * (FPS_GUARD ? guardScale : 1.0);
+    return { dpr, desired, cap, final, capped: cap + 1e-6 < desired, guarded: FPS_GUARD && guardScale < 0.999 };
+  }
+
+  function effectiveScale(){ return computeScales().final; }
+
+  function updateResReadout(){
+    const s = computeScales();
+    const flags = (s.capped ? ' • auto-capped' : '') + (s.guarded ? ' • fps-guard' : '');
+    UI.res.textContent = `Res ${s.final.toFixed(2)}×  •  ${W}×${H}px${flags}`;
   }
 
   function resize(){
     const scale = effectiveScale();
-    W = cv.width  = Math.floor(innerWidth  * scale);
-    H = cv.height = Math.floor(innerHeight * scale);
+    const newW = Math.floor(innerWidth  * scale);
+    const newH = Math.floor(innerHeight * scale);
+    if (newW === W && newH === H) { updateResReadout(); return; }
+
+    W = cv.width  = newW;
+    H = cv.height = newH;
     fb.width = W; fb.height = H;
+
+    applyCrispness();
     updateResReadout();
   }
   addEventListener('resize', resize, {passive:true});
@@ -163,7 +205,13 @@
     warp:  $('#warp'), fiboSpeed: $('#fiboSpeed'),
     psyOn: $('#psyOn'), psyInf: $('#psyInf'), psySym: $('#psySym'),
     psyFreq: $('#psyFreq'), psyLayers: $('#psyLayers'), psyFlow: $('#psyFlow'),
-    renderScale: $('#renderScale'), hidpi: $('#hidpi'), hidpi3: $('#hidpi3'), res: $('#res')
+
+    // Display controls
+    renderScale: $('#renderScale'), hidpi: $('#hidpi'), hidpi3: $('#hidpi3'),
+    autoQ: $('#autoQ'), pxBudget: $('#pxBudget'),
+    fpsGuard: $('#fpsGuard'), fpsTarget: $('#fpsTarget'),
+    crisp: $('#crisp'),
+    res: $('#res')
   };
 
   // State
@@ -180,7 +228,7 @@
   let edgePhase = 0;
 
   // FPS
-  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0;
+  const fpsEl = $('#fps'); let fpsAcc=0, fpsFrames=0, fpsT=0, lastFPS=60;
 
   // Utils
   const rnd  = (a=1)=> Math.random()*a;
@@ -197,15 +245,15 @@
     el.dispatchEvent(new Event('input', {bubbles:true}));
   }
 
-  function updateResReadout(){
-    const dpr = USE_HIDPI ? Math.min(window.devicePixelRatio || 1, HIDPI_MAX3 ? 3 : 2) : 1;
-    const eff = (dpr * RENDER_SCALE).toFixed(2);
-    UI.res.textContent = `Res ${eff}×  •  ${W}×${H}px`;
-  }
   function applyDisplaySettings(){
-    RENDER_SCALE = parseFloat(UI.renderScale.value) || 1;
-    USE_HIDPI = !!UI.hidpi.checked;
-    HIDPI_MAX3 = !!UI.hidpi3.checked;
+    RENDER_SCALE   = parseFloat(UI.renderScale.value) || 1;
+    USE_HIDPI      = !!UI.hidpi.checked;
+    HIDPI_MAX3     = !!UI.hidpi3.checked;
+    AUTO_QUALITY   = !!UI.autoQ.checked;
+    PIXEL_BUDGET_MP= parseFloat(UI.pxBudget.value) || 3.0;
+    FPS_GUARD      = !!UI.fpsGuard.checked;
+    FPS_TARGET     = parseInt(UI.fpsTarget.value,10) || 58;
+    CRISP          = !!UI.crisp.checked;
     resize();
   }
 
@@ -255,11 +303,12 @@
     timeScale = +UI.warp.value;
   }
 
-  // Randomize with constraints; EXCLUDE display + edge budget
+  // Randomize with constraints; EXCLUDE display + perf controls
+  const SKIP_RANDOM = new Set(['renderScale','hidpi','hidpi3','autoQ','pxBudget','fpsGuard','fpsTarget','crisp','edgeBudget']);
   function randomizeAll(){
     for (const inp of panel.querySelectorAll('input[type="range"]')) {
       const id = inp.id;
-      if (id === 'renderScale' || id === 'edgeBudget') continue;
+      if (SKIP_RANDOM.has(id)) continue;
 
       const min = parseFloat(inp.min), max = parseFloat(inp.max), step = parseFloat(inp.step||'1');
       const span = max - min;
@@ -305,12 +354,18 @@
   UI.renderScale.addEventListener('input', applyDisplaySettings);
   UI.hidpi.addEventListener('change', applyDisplaySettings);
   UI.hidpi3.addEventListener('change', applyDisplaySettings);
+  UI.autoQ.addEventListener('change', applyDisplaySettings);
+  UI.pxBudget.addEventListener('input', applyDisplaySettings);
+  UI.fpsGuard.addEventListener('change', applyDisplaySettings);
+  UI.fpsTarget.addEventListener('input', applyDisplaySettings);
+  UI.crisp.addEventListener('change', applyDisplaySettings);
 
   // Initial sizing & nodes
+  applyCrispness();
   resize();
   makeNodes(+UI.nodes.value);
 
-  // ---------- Performance: persistent spatial grid (typed arrays) ----------
+  // ---------- Persistent spatial grid (typed arrays) ----------
   let gridCell = 64, gridCols = 0, gridRows = 0, heads = null, next = null;
   function ensureGrid(cell){
     const cols = Math.floor(W / cell) + 1;
@@ -324,20 +379,17 @@
     }
     heads.fill(-1);
   }
-
   function binIndex(x,y){
     const cx = x < 0 ? 0 : (x >= W ? (W-1) : x) / gridCell | 0;
     const cy = y < 0 ? 0 : (y >= H ? (H-1) : y) / gridCell | 0;
     return cy*gridCols + cx;
   }
-
-  // stable pair hash -> 0..1
   function pairHash(i,j){
     const a = (i+1)*73856093 ^ (j+1)*19349663;
     return (a >>> 0) / 4294967295;
   }
 
-  // ---------- Optimized edge drawing (sampling + no sqrt in hot loop) ----------
+  // ---------- Optimized edge drawing (sampling + no sqrt) ----------
   function drawEdgesFast(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ){
     const reach0 = linkR * 0.6, reach1 = linkR;
     const reach02 = reach0*reach0, reach12 = reach1*reach1;
@@ -355,7 +407,7 @@
     // Sampling probability to meet Edge Budget
     const N = nodes.length;
     const density = N / (W*H + 1e-6);
-    const k_est = Math.PI * reach12 * density;        // expected neighbors per node (uniform)
+    const k_est = Math.PI * reach12 * density;
     const targetK = +UI.edgeBudget.value;
     const baseP = clamp(targetK / (k_est + 1e-6), 0.0, 1.0);
 
@@ -370,27 +422,23 @@
         for (let nx=acx-1; nx<=acx+1; nx++){
           if (nx<0 || nx>=gridCols) continue;
           for (let j = heads[ny*gridCols + nx]; j !== -1; j = next[j]){
-            if (j <= i) continue; // de-dup
+            if (j <= i) continue;
 
             const b = nodes[j];
             const dx = a.x - b.x, dy = a.y - b.y;
             const d2 = dx*dx + dy*dy;
             if (d2 >= reach12) continue;
 
-            // Distance-based fade without sqrt
             const fade1 = 1 - (d2 / reach12); if (fade1 <= 0) continue;
-            // Bias sampling toward closer edges so structure holds
             const p = baseP * (0.35 + 0.65 * fade1);
             if (Math.random() > p) continue;
 
-            // Color from pair hash + stepped phase
             const ehue = (edgeBase + edgePhaseQ + pairHash(i,j)*360) % 360;
 
-            // Midpoint jitter + optional field warp on thick pass
             let mx = (a.x+b.x)*0.5, my = (a.y+b.y)*0.5;
             let jx1 = rndN(6 + 22*fade1), jy1 = rndN(6 + 22*fade1);
 
-            // THIN PASS (shorter reach, lower alpha)
+            // THIN PASS
             if (d2 < reach02){
               const fade0 = 1 - (d2 / reach02);
               const a0 = clamp(0.06 + 0.25*fade0, 0, 0.55);
@@ -403,7 +451,7 @@
               ctx.stroke();
             }
 
-            // THICK PASS (full reach, field warp)
+            // THICK PASS + field warp
             let jx = jx1, jy = jy1;
             if (psyON && psyInf>0){
               const Fm = fieldValue(mx,my,tField,psySym,psyFreq,psyLayers);
@@ -512,7 +560,7 @@
         ctx.fill();
       }
 
-      // Fast edges
+      // Edges
       drawEdgesFast(linkR, thick, psyON, psyInf, psySym, psyFreq, psyLayers, tField, now, edgePhaseQ);
 
       // Snapshot for feedback
@@ -520,9 +568,26 @@
       fbc.drawImage(cv, 0, 0, W, H);
     }
 
-    // FPS
+    // FPS meter + guard adapt (every ~0.5s)
     fpsAcc += 1/Math.max(dtRaw, 1e-6); fpsFrames++; fpsT += dtRaw;
-    if (fpsT > 0.5) { fpsEl.textContent = `${(fpsAcc/fpsFrames).toFixed(0)} fps`; fpsAcc=0; fpsFrames=0; fpsT=0; }
+    if (fpsT > 0.5) {
+      lastFPS = fpsAcc / fpsFrames;
+      fpsEl.textContent = `${lastFPS.toFixed(0)} fps`;
+
+      if (FPS_GUARD){
+        // Gentle down when below target; gentle up when above
+        if (lastFPS < FPS_TARGET - 2) {
+          guardScale = Math.max(0.5, guardScale * 0.96);
+          resize();
+        } else if (lastFPS > FPS_TARGET + 6) {
+          const old = guardScale;
+          guardScale = Math.min(1.0, guardScale * 1.02);
+          if (guardScale !== old) resize();
+        }
+      }
+
+      fpsAcc=0; fpsFrames=0; fpsT=0;
+    }
 
     requestAnimationFrame(draw);
   }
@@ -673,7 +738,6 @@
     const el = document.getElementById(b.targetId); if (!el) return;
     let norm = 0;
     switch(msg.type){
-      case 0x0: break;
       case 'cc':  norm = msg.value / 127; break;
       case 'at':  norm = msg.value / 127; break;
       case 'note': norm = msg.vel / 127; break;
@@ -711,9 +775,11 @@
   }
 
   // Initial motion + load mappings
-  setTimeout(() => { hueBase = Math.random()*360; edgeBase = Math.random()*360; for (const n of nodes){ const s=1.5+Math.random()*3.0; const a=Math.random()*Math.PI*2; n.vx=Math.cos(a)*s; n.vy=Math.sin(a)*s; }}, 250);
-  (function loadBindings(){ try{ const raw = localStorage.getItem('glitchMeshMidiBindings_v1'); if (!raw) return; const arr=JSON.parse(raw); if (Array.isArray(arr)){ bindings=arr; for (const b of bindings){ const el=document.getElementById(b.targetId); if (el) { const lbl=(b.type==='cc'?`CC${b.controller}`:b.type==='pb'?'PitchBend':b.type==='at'?'Aftertouch':`Note${b.note}`)+` ch${b.channel}`; const badge=el.parentElement.querySelector('.midi-badge'); if (badge){ badge.textContent='🔗 '+lbl; badge.hidden=false; } } } } }catch(e){} })();
-
+  setTimeout(() => {
+    hueBase = Math.random()*360; edgeBase = Math.random()*360;
+    for (const n of nodes){ const s=1.5+Math.random()*3.0; const a=Math.random()*Math.PI*2; n.vx=Math.cos(a)*s; n.vy=Math.sin(a)*s; }
+  }, 250);
+  loadBindings();
 })();
 </script>
 </body>
